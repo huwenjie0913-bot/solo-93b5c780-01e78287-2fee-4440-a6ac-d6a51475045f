@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# 虚拟环境与本地引导的依赖副本
+.venv/
+.pylibs/
+.cache/
+
+# 测试/运行时缓存
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 本地场景数据库
+data/*.db
+data/*.db-journal

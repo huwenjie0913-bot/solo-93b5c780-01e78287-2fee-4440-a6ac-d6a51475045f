@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: forensic-timeline-api
+Version: 1.0.0
+Summary: 多源取证时间线校核 API：时区/偏移/漂移换算、差分约束求解、矛盾链与偏移建议
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: fastapi<1.0,>=0.110
+Requires-Dist: pydantic<3.0,>=2.5
+Requires-Dist: uvicorn[standard]<1.0,>=0.27
+Provides-Extra: dev
+Requires-Dist: httpx<1.0,>=0.27; extra == "dev"
+Requires-Dist: pytest>=7.4; extra == "dev"
