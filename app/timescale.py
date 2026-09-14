@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from .models import (
@@ -50,22 +50,26 @@ def parse_unix(value: str, fallback_utc_offset_s: float = 0.0) -> tuple[float, b
     except ValueError as exc:
         raise TimeParseError(f"无法解析 ISO 8601 时间：{value!r}（{exc}）") from exc
     if dt.tzinfo is not None:
+        # 显式偏移：直接换算为 UTC，与进程时区无关
         return dt.timestamp(), True
-    # naive：按给定 UTC 偏移解释本地钟面，utc = local - offset
-    return dt.timestamp() - fallback_utc_offset_s, False
+    # naive：把钟面读数当作“声明偏移下的本地墙钟时间”。
+    # 先按 UTC 解释该墙钟（datetime(...).replace(tzinfo=utc).timestamp()
+    # 对 naive 值不受进程 TZ 影响），再减去声明偏移：
+    #     unix = 墙钟(按UTC) - offset
+    as_utc = dt.replace(tzinfo=timezone.utc)
+    return as_utc.timestamp() - fallback_utc_offset_s, False
 
 
 def format_iso(unix_seconds: float) -> str:
     """Unix 秒格式化为带 Z 的 UTC ISO 8601 字符串（保留毫秒）。"""
     if not math.isfinite(unix_seconds):
         return "invalid"
-    dt = datetime.fromtimestamp(unix_seconds, tz=None)
     whole = int(math.floor(unix_seconds))
     millis = int(round((unix_seconds - whole) * 1000))
     if millis == 1000:
         whole += 1
         millis = 0
-    base = datetime.utcfromtimestamp(whole).strftime("%Y-%m-%dT%H:%M:%S")
+    base = datetime.fromtimestamp(whole, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     return f"{base}.{millis:03d}Z" if millis else f"{base}Z"
 
 
