@@ -91,6 +91,38 @@ class Constraint(BaseModel):
     note: Optional[str] = None
 
 
+class AssociationCandidate(BaseModel):
+    """关联组中基准事件的一个候选“同一事件”对象。"""
+
+    event_id: str = Field(..., description="候选事件 ID")
+    tolerance_s: float = Field(
+        0.0, ge=0.0, description="匹配容差（秒）：选中后要求 |t_base − t_cand| ≤ 容差"
+    )
+    cost: float = Field(
+        0.0, ge=0.0, description="选中该候选时计入假设总代价的代价（≥0，缺省 0）"
+    )
+    note: Optional[str] = None
+
+
+class AssociationGroup(BaseModel):
+    """一个候选关联组：为基准事件从候选列表中择一（或至多择一）配对。
+
+    ``exactly_one``：必须恰好选中一个候选；``at_most_one``：可选中一个，
+    也可以一个都不选（跳过）。候选事件为全局资源：同一候选事件
+    不能被多个关联组同时选中（不可跨组复用）。
+    """
+
+    id: str = Field(..., description="关联组 ID，如 g-badge")
+    base_event_id: str = Field(..., description="基准事件 ID")
+    mode: Literal["exactly_one", "at_most_one"] = Field(
+        "exactly_one", description="选择基数：恰好一个 / 至多一个"
+    )
+    candidates: list[AssociationCandidate] = Field(
+        default_factory=list, description="候选事件列表（exactly_one 时不能为空）"
+    )
+    note: Optional[str] = None
+
+
 class Scenario(BaseModel):
     """一次校核的完整场景输入。"""
 
@@ -104,6 +136,10 @@ class Scenario(BaseModel):
     anchors: list[CalibrationAnchor] = Field(default_factory=list)
     events: list[Event] = Field(default_factory=list)
     constraints: list[Constraint] = Field(default_factory=list)
+    association_groups: list[AssociationGroup] = Field(
+        default_factory=list,
+        description="候选事件关联组；缺省为空，行为与旧版本完全一致",
+    )
 
 
 # ----------------------------- 输出模型 -----------------------------
@@ -201,6 +237,106 @@ class AdjustmentReport(BaseModel):
     method: str
 
 
+class AssociationPairing(BaseModel):
+    """一个假设中被选中的配对（基准事件 ↔ 候选事件）。"""
+
+    group_id: str
+    base_event_id: str
+    candidate_event_id: str
+    constraint_id: str = Field(
+        ..., description="该配对生成的 same_event 约束 ID（assoc:<组ID>），可在约束余量中追溯"
+    )
+    tolerance_s: float
+    cost: float
+    time_residual_s: float = Field(
+        ..., description="统一时间线下两事件可行窗口的最小间距（秒，0 表示窗口相交）"
+    )
+
+
+class ScoreComponent(BaseModel):
+    """假设评分的单项组成（一个选中配对的贡献）。"""
+
+    group_id: str
+    candidate_event_id: str
+    cost: float
+    time_residual_s: float
+
+
+class HypothesisScore(BaseModel):
+    """可追溯的假设评分：总代价 + 时间残差 + 逐项组成。"""
+
+    total_cost: float = Field(..., description="全部选中配对的候选代价之和")
+    time_residual_s: float = Field(..., description="全部选中配对的时间残差之和（秒）")
+    components: list[ScoreComponent] = Field(default_factory=list)
+    derived_by: str
+    detail: str
+
+
+class AssociationHypothesis(BaseModel):
+    """一个可行的关联假设：选中的配对 + 统一时间线 + 约束余量 + 评分。"""
+
+    rank: int = Field(..., description="按（总代价, 时间残差, 发现序）稳定排序后的名次，从 1 开始")
+    pairings: list[AssociationPairing] = Field(default_factory=list)
+    score: HypothesisScore
+    unified_timeline: list[EventWindow] = Field(default_factory=list)
+    constraint_slack: list[ConstraintSlack] = Field(default_factory=list)
+
+
+class GroupElimination(BaseModel):
+    """搜索中某关联组被剪枝的统计与样本矛盾链。"""
+
+    group_id: str
+    base_event_id: str
+    pruned_branches: int = Field(
+        ..., description="该组层面上被差分约束校核剪掉的候选分支总数（跨整棵搜索树累计）"
+    )
+    total_options: int = Field(..., description="该组的可选项数（候选数，at_most_one 含跳过项）")
+    sample_contradiction: Optional[Contradiction] = Field(
+        None, description="该组首个被剪枝分支的矛盾链样本"
+    )
+
+
+class AssociationSearchStats(BaseModel):
+    """关联求解的搜索统计。"""
+
+    groups_total: int
+    nodes_expanded: int = Field(..., description="展开的搜索节点数（含根节点）")
+    branches_pruned: int = Field(..., description="被差分约束校核剪枝的分支数")
+    reuse_conflicts: int = Field(
+        ..., description="因候选事件跨组复用冲突而被跳过的分支数"
+    )
+    leaves_feasible: int = Field(..., description="找到的可行完整假设数（≤ max_hypotheses）")
+    top_k: int
+    max_hypotheses: int
+    max_search_nodes: int
+    truncated: bool
+    truncation_reason: Optional[str] = Field(
+        None, description="截断原因：node_limit / hypothesis_limit；未截断为 null"
+    )
+
+
+class AssociationResult(BaseModel):
+    """候选事件关联求解结果。"""
+
+    status: Literal["ok", "infeasible", "truncated"] = Field(
+        ...,
+        description="ok=搜索完成且有可行假设；infeasible=搜索完成但无解；truncated=达到搜索上限被截断",
+    )
+    hypotheses: list[AssociationHypothesis] = Field(
+        default_factory=list, description="按（总代价, 时间残差）稳定排序的前 K 个可行假设"
+    )
+    total_feasible_found: int = Field(..., description="搜索中发现的可行假设总数（≤ max_hypotheses）")
+    returned_k: int = Field(..., description="本次返回的假设数")
+    eliminated_groups: list[GroupElimination] = Field(
+        default_factory=list, description="搜索中发生过分支剪枝的关联组及样本矛盾链"
+    )
+    contradiction: Optional[Contradiction] = Field(
+        None, description="代表性矛盾链（最深被剪枝分支；基础场景不可行时为基础矛盾）"
+    )
+    stats: AssociationSearchStats
+    method: str
+
+
 class ReconcileResult(BaseModel):
     scenario_name: str
     feasible: bool
@@ -210,6 +346,9 @@ class ReconcileResult(BaseModel):
     constraint_slack: list[ConstraintSlack] = Field(default_factory=list)
     contradiction: Optional[Contradiction] = None
     adjustment: Optional[AdjustmentReport] = None
+    association: Optional[AssociationResult] = Field(
+        None, description="声明了关联组时的候选关联求解结果；未声明为 null"
+    )
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -237,6 +376,27 @@ class PlanDifference(BaseModel):
     constraints_only_right: list[str]
     sources_only_left: list[str]
     sources_only_right: list[str]
+    association_groups_only_left: list[str] = Field(
+        default_factory=list, description="仅左方案声明的关联组 ID"
+    )
+    association_groups_only_right: list[str] = Field(
+        default_factory=list, description="仅右方案声明的关联组 ID"
+    )
+    association_groups_changed: list[str] = Field(
+        default_factory=list, description="两侧都存在但规则定义不同的关联组 ID"
+    )
+    hypotheses_left: Optional[int] = Field(
+        None, description="左方案关联求解返回的假设数（无关联组为 null）"
+    )
+    hypotheses_right: Optional[int] = Field(
+        None, description="右方案关联求解返回的假设数（无关联组为 null）"
+    )
+    best_cost_left: Optional[float] = Field(
+        None, description="左方案最优假设总代价（无可行假设为 null）"
+    )
+    best_cost_right: Optional[float] = Field(
+        None, description="右方案最优假设总代价（无可行假设为 null）"
+    )
     event_window_deltas_s: dict[str, dict[str, float]] = Field(
         default_factory=dict,
         description="共有事件的最早/最晚/中点时刻差（右-左，秒）",

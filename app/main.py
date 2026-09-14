@@ -40,6 +40,16 @@ def _store() -> Store:
     return Store(os.environ.get("FORENSIC_DB", os.path.join("data", "forensic.db")))
 
 
+# 关联求解搜索上限的查询参数（在 max_hypotheses / max_search_nodes 内返回前 top_k 个假设）
+AssocTopK = Query(3, ge=1, le=100, description="返回的关联假设个数上限 K")
+AssocMaxHypotheses = Query(
+    100, ge=1, le=100_000, description="关联求解收集的可行假设总数上限"
+)
+AssocMaxSearchNodes = Query(
+    10_000, ge=1, le=1_000_000, description="关联求解展开的搜索节点数上限"
+)
+
+
 @app.get("/health", tags=["系统"])
 def health() -> dict:
     return {"status": "ok", "version": __version__}
@@ -58,9 +68,18 @@ def reconcile_endpoint(
         ge=0,
         description="限定每个时钟来源允许的修正幅度上限（秒）；给定后返回偏移建议报告",
     ),
+    top_k: int = AssocTopK,
+    max_hypotheses: int = AssocMaxHypotheses,
+    max_search_nodes: int = AssocMaxSearchNodes,
 ) -> ReconcileResult:
     try:
-        return reconcile(scenario, budget_s=budget_s)
+        return reconcile(
+            scenario,
+            budget_s=budget_s,
+            assoc_top_k=top_k,
+            assoc_max_hypotheses=max_hypotheses,
+            assoc_max_search_nodes=max_search_nodes,
+        )
     except ScenarioValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -154,6 +173,9 @@ def reconcile_stored(
     scenario_id: str,
     version: Optional[int] = None,
     budget_s: Optional[float] = Query(None, ge=0),
+    top_k: int = AssocTopK,
+    max_hypotheses: int = AssocMaxHypotheses,
+    max_search_nodes: int = AssocMaxSearchNodes,
 ) -> ReconcileResult:
     store = _store()
     try:
@@ -163,7 +185,13 @@ def reconcile_stored(
     finally:
         store.close()
     try:
-        return reconcile(sv.payload, budget_s=budget_s)
+        return reconcile(
+            sv.payload,
+            budget_s=budget_s,
+            assoc_top_k=top_k,
+            assoc_max_hypotheses=max_hypotheses,
+            assoc_max_search_nodes=max_search_nodes,
+        )
     except ScenarioValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -182,6 +210,13 @@ class CompareBody(BaseModel):
     right_version: Optional[int] = None
     budget_s: Optional[float] = Field(
         None, ge=0, description="两侧计算最小修正预算时统一使用的修正幅度上限（秒）"
+    )
+    top_k: int = Field(3, ge=1, le=100, description="两侧关联求解返回的假设个数上限 K")
+    max_hypotheses: int = Field(
+        100, ge=1, le=100_000, description="两侧关联求解收集的可行假设总数上限"
+    )
+    max_search_nodes: int = Field(
+        10_000, ge=1, le=1_000_000, description="两侧关联求解展开的搜索节点数上限"
     )
 
 
@@ -212,8 +247,20 @@ def compare(body: CompareBody) -> PlanDifference:
     left_s, left_ref = _resolve(body, "left")
     right_s, right_ref = _resolve(body, "right")
     try:
-        left_r = reconcile(left_s, budget_s=body.budget_s)
-        right_r = reconcile(right_s, budget_s=body.budget_s)
+        left_r = reconcile(
+            left_s,
+            budget_s=body.budget_s,
+            assoc_top_k=body.top_k,
+            assoc_max_hypotheses=body.max_hypotheses,
+            assoc_max_search_nodes=body.max_search_nodes,
+        )
+        right_r = reconcile(
+            right_s,
+            budget_s=body.budget_s,
+            assoc_top_k=body.top_k,
+            assoc_max_hypotheses=body.max_hypotheses,
+            assoc_max_search_nodes=body.max_search_nodes,
+        )
     except ScenarioValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return diff_plans(left_r, right_r, left_ref, right_ref, left_s, right_s)

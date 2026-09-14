@@ -1,4 +1,4 @@
-"""校核引擎：时钟换算 → 差分约束 → 求解/矛盾 → 偏移建议/方案比较。"""
+"""校核引擎：时钟换算 → 差分约束 → 求解/矛盾 → 偏移建议/方案比较 → 候选关联。"""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ from .models import (
     Constraint,
     ConstraintSlack,
     Contradiction,
-    Event,
     EventIntervalInput,
     EventWindow,
     PlanDifference,
@@ -74,6 +73,27 @@ def validate_scenario(scenario: Scenario) -> None:
             and c.type == "min_interval"
         ):
             pass
+    constraint_ids = {c.id for c in scenario.constraints}
+    seen.clear()
+    for g in scenario.association_groups:
+        if g.id in seen:
+            errs.append(f"关联组 ID 重复：{g.id}")
+        seen.add(g.id)
+        if f"assoc:{g.id}" in constraint_ids:
+            errs.append(f"关联组 {g.id} 生成的约束 ID assoc:{g.id} 与已有约束冲突")
+        if g.base_event_id not in events:
+            errs.append(f"关联组 {g.id} 的基准事件 {g.base_event_id} 不存在")
+        if g.mode == "exactly_one" and not g.candidates:
+            errs.append(f"关联组 {g.id} 为 exactly_one 但候选列表为空")
+        cand_seen: set[str] = set()
+        for cand in g.candidates:
+            if cand.event_id not in events:
+                errs.append(f"关联组 {g.id} 的候选事件 {cand.event_id} 不存在")
+            if cand.event_id == g.base_event_id:
+                errs.append(f"关联组 {g.id} 的候选事件不能与基准事件相同（{cand.event_id}）")
+            if cand.event_id in cand_seen:
+                errs.append(f"关联组 {g.id} 的候选事件 {cand.event_id} 重复")
+            cand_seen.add(cand.event_id)
     if errs:
         raise ScenarioValidationError("；".join(errs))
 
@@ -117,6 +137,98 @@ def build_graph(
     for c in constraints:
         edges.extend(_constraint_edges(c, idx))
     return n, idx, edges
+
+
+# ----------------------------- 结果组装（可行时间线 / 约束余量） -----------------------------
+
+
+def _build_timeline(
+    intervals: list[EventIntervalInput],
+    idx: dict[str, int],
+    lower: list[float],
+    upper: list[float],
+) -> list[EventWindow]:
+    """由差分系统求得的每事件最早/最晚时刻组装统一时间线。"""
+    timeline: list[EventWindow] = []
+    for iv in intervals:
+        i = idx[iv.event_id]
+        lo, hi = lower[i], upper[i]
+        mid = (lo + hi) / 2
+        width = hi - lo
+        q_lo = Quantity(
+            value=lo,
+            unit="unix_seconds_utc",
+            source_ids=[iv.source_id] if iv.source_id else [],
+            anchor_ids=list(iv.quantity.anchor_ids),
+            event_ids=[iv.event_id],
+            derived_by="dcs.shortest_path_lower_bound",
+            detail=f"取反图上从历元节点 0 到事件节点 {i} 的最短路，即该事件最早可能时刻",
+        )
+        q_hi = Quantity(
+            value=hi,
+            unit="unix_seconds_utc",
+            source_ids=[iv.source_id] if iv.source_id else [],
+            anchor_ids=list(iv.quantity.anchor_ids),
+            event_ids=[iv.event_id],
+            derived_by="dcs.shortest_path_upper_bound",
+            detail=f"原图上从历元节点 0 到事件节点 {i} 的最短路，即该事件最晚可能时刻",
+        )
+        q_w = Quantity(
+            value=width,
+            unit="s",
+            source_ids=[iv.source_id] if iv.source_id else [],
+            anchor_ids=list(iv.quantity.anchor_ids),
+            event_ids=[iv.event_id],
+            derived_by="engine.window_width",
+            detail="最晚 - 最早；0 表示该事件时刻被约束完全钉死",
+        )
+        timeline.append(
+            EventWindow(
+                earliest=format_iso(lo),
+                latest=format_iso(hi),
+                earliest_unix_s=q_lo,
+                latest_unix_s=q_hi,
+                representative=format_iso(mid),
+                width_s=q_w,
+                source_id=iv.source_id,
+            )
+        )
+    return timeline
+
+
+def _build_slack(
+    edges: list[Edge],
+    constraints: list[Constraint],
+    lower: list[float],
+    upper: list[float],
+) -> list[ConstraintSlack]:
+    """逐条用户约束（含关联求解生成的 same_event 约束）计算约束余量。"""
+    slack_map = edge_slack(edges, lower, upper)
+    slack_reports: list[ConstraintSlack] = []
+    for c in constraints:
+        per_edges = slack_map[c.id]
+        worst = min(s for _, s in per_edges)
+        tight_names = {
+            "before": f"t({c.b}) - t({c.a}) ≥ 0",
+            "same_event": f"|t({c.a}) - t({c.b})| ≤ {c.tolerance_s:g}s",
+            "min_interval": f"t({c.b}) - t({c.a}) ≥ {c.min_s:g}s" if c.min_s is not None else "min_interval",
+            "max_interval": f"t({c.b}) - t({c.a}) ≤ {c.max_s:g}s" if c.max_s is not None else "max_interval",
+        }
+        slack_reports.append(
+            ConstraintSlack(
+                constraint_id=c.id,
+                type=c.type,
+                a=c.a,
+                b=c.b,
+                satisfiable=worst >= -1e-9,
+                slack_s=max(worst, 0.0),
+                detail=(
+                    f"{tight_names[c.type]}；约束余量 {worst:.3f}s"
+                    + ("（紧约束）" if abs(worst) <= 1e-9 else "")
+                ),
+            )
+        )
+    return slack_reports
 
 
 # ----------------------------- 矛盾链 -----------------------------
@@ -448,7 +560,13 @@ def _shift_cycle_contradiction(
 # ----------------------------- 主编排 -----------------------------
 
 
-def reconcile(scenario: Scenario, budget_s: Optional[float] = None) -> ReconcileResult:
+def reconcile(
+    scenario: Scenario,
+    budget_s: Optional[float] = None,
+    assoc_top_k: int = 3,
+    assoc_max_hypotheses: int = 100,
+    assoc_max_search_nodes: int = 10_000,
+) -> ReconcileResult:
     validate_scenario(scenario)
     warnings: list[str] = []
     try:
@@ -493,88 +611,20 @@ def reconcile(scenario: Scenario, budget_s: Optional[float] = None) -> Reconcile
         for adj in result.adjustment.adjustments:
             if adj.source_id in reports:
                 adj.clock_model_offset_s = reports[adj.source_id].offset_s.value
+        _attach_association(
+            result, scenario, intervals,
+            assoc_top_k, assoc_max_hypotheses, assoc_max_search_nodes,
+        )
         return result
 
-    # 可行：组装统一时间线
-    timeline: list[EventWindow] = []
-    for iv in intervals:
-        i = idx[iv.event_id]
-        lo, hi = lower[i], upper[i]
-        mid = (lo + hi) / 2
-        width = hi - lo
-        q_lo = Quantity(
-            value=lo,
-            unit="unix_seconds_utc",
-            source_ids=[iv.source_id] if iv.source_id else [],
-            anchor_ids=list(iv.quantity.anchor_ids),
-            event_ids=[iv.event_id],
-            derived_by="dcs.shortest_path_lower_bound",
-            detail=f"取反图上从历元节点 0 到事件节点 {i} 的最短路，即该事件最早可能时刻",
-        )
-        q_hi = Quantity(
-            value=hi,
-            unit="unix_seconds_utc",
-            source_ids=[iv.source_id] if iv.source_id else [],
-            anchor_ids=list(iv.quantity.anchor_ids),
-            event_ids=[iv.event_id],
-            derived_by="dcs.shortest_path_upper_bound",
-            detail=f"原图上从历元节点 0 到事件节点 {i} 的最短路，即该事件最晚可能时刻",
-        )
-        q_w = Quantity(
-            value=width,
-            unit="s",
-            source_ids=[iv.source_id] if iv.source_id else [],
-            anchor_ids=list(iv.quantity.anchor_ids),
-            event_ids=[iv.event_id],
-            derived_by="engine.window_width",
-            detail="最晚 - 最早；0 表示该事件时刻被约束完全钉死",
-        )
-        timeline.append(
-            EventWindow(
-                earliest=format_iso(lo),
-                latest=format_iso(hi),
-                earliest_unix_s=q_lo,
-                latest_unix_s=q_hi,
-                representative=format_iso(mid),
-                width_s=q_w,
-                source_id=iv.source_id,
-            )
-        )
-
-    # 约束余量
-    slack_map = edge_slack(edges, lower, upper)
-    slack_reports: list[ConstraintSlack] = []
-    for c in scenario.constraints:
-        per_edges = slack_map[c.id]
-        worst = min(s for _, s in per_edges)
-        tight_names = {
-            "before": f"t({c.b}) - t({c.a}) ≥ 0",
-            "same_event": f"|t({c.a}) - t({c.b})| ≤ {c.tolerance_s:g}s",
-            "min_interval": f"t({c.b}) - t({c.a}) ≥ {c.min_s:g}s" if c.min_s is not None else "min_interval",
-            "max_interval": f"t({c.b}) - t({c.a}) ≤ {c.max_s:g}s" if c.max_s is not None else "max_interval",
-        }
-        slack_reports.append(
-            ConstraintSlack(
-                constraint_id=c.id,
-                type=c.type,
-                a=c.a,
-                b=c.b,
-                satisfiable=worst >= -1e-9,
-                slack_s=max(worst, 0.0),
-                detail=(
-                    f"{tight_names[c.type]}；约束余量 {worst:.3f}s"
-                    + ("（紧约束）" if abs(worst) <= 1e-9 else "")
-                ),
-            )
-        )
-
+    # 可行：组装统一时间线与约束余量
     result = ReconcileResult(
         scenario_name=scenario.name,
         feasible=True,
-        unified_timeline=timeline,
+        unified_timeline=_build_timeline(intervals, idx, lower, upper),
         clock_models=list(reports.values()),
         event_intervals=intervals,
-        constraint_slack=slack_reports,
+        constraint_slack=_build_slack(edges, scenario.constraints, lower, upper),
         warnings=warnings,
     )
     if budget_s is not None:
@@ -585,7 +635,34 @@ def reconcile(scenario: Scenario, budget_s: Optional[float] = None) -> Reconcile
         for adj in result.adjustment.adjustments:
             if adj.source_id in reports:
                 adj.clock_model_offset_s = reports[adj.source_id].offset_s.value
+    _attach_association(
+        result, scenario, intervals,
+        assoc_top_k, assoc_max_hypotheses, assoc_max_search_nodes,
+    )
     return result
+
+
+def _attach_association(
+    result: ReconcileResult,
+    scenario: Scenario,
+    intervals: list[EventIntervalInput],
+    top_k: int,
+    max_hypotheses: int,
+    max_search_nodes: int,
+) -> None:
+    """声明了关联组时执行候选关联求解并挂到结果上；未声明则保持原行为。"""
+    if not scenario.association_groups:
+        return
+    from .associate import solve_associations  # 延迟导入，避免与 engine 循环依赖
+
+    result.association = solve_associations(
+        intervals=intervals,
+        constraints=scenario.constraints,
+        groups=scenario.association_groups,
+        top_k=top_k,
+        max_hypotheses=max_hypotheses,
+        max_search_nodes=max_search_nodes,
+    )
 
 
 # ----------------------------- 方案比较 -----------------------------
@@ -619,6 +696,25 @@ def diff_plans(
     rs = {s.id for s in right_scenario.sources}
     lc = {c.id for c in left_scenario.constraints}
     rc = {c.id for c in right_scenario.constraints}
+    lag = {g.id: g for g in left_scenario.association_groups}
+    rag = {g.id: g for g in right_scenario.association_groups}
+    changed_groups = sorted(
+        gid for gid in set(lag) & set(rag)
+        if lag[gid].model_dump() != rag[gid].model_dump()
+    )
+
+    def _assoc_summary(r: ReconcileResult) -> tuple[Optional[int], Optional[float]]:
+        if r.association is None:
+            return None, None
+        best = (
+            r.association.hypotheses[0].score.total_cost
+            if r.association.hypotheses
+            else None
+        )
+        return len(r.association.hypotheses), best
+
+    hyp_l, cost_l = _assoc_summary(left)
+    hyp_r, cost_r = _assoc_summary(right)
     return PlanDifference(
         left_ref=left_ref,
         right_ref=right_ref,
@@ -628,6 +724,13 @@ def diff_plans(
         constraints_only_right=sorted(rc - lc),
         sources_only_left=sorted(ls - rs),
         sources_only_right=sorted(rs - ls),
+        association_groups_only_left=sorted(set(lag) - set(rag)),
+        association_groups_only_right=sorted(set(rag) - set(lag)),
+        association_groups_changed=changed_groups,
+        hypotheses_left=hyp_l,
+        hypotheses_right=hyp_r,
+        best_cost_left=cost_l,
+        best_cost_right=cost_r,
         event_window_deltas_s=deltas,
         feasible_left=left.feasible,
         feasible_right=right.feasible,
@@ -635,6 +738,8 @@ def diff_plans(
         min_budget_right_s=(right.adjustment.min_required_budget_s if right.adjustment else None),
         explanation=(
             "event_window_deltas_s 中各量为右方案相对左方案的秒级差值（右-左）；"
-            "宽度差为正表示右方案该事件的可行时刻范围更宽"
+            "宽度差为正表示右方案该事件的可行时刻范围更宽；"
+            "association_groups_* 比较两侧声明的候选关联规则，"
+            "hypotheses_*/best_cost_* 为各自关联求解返回的假设数与最优假设总代价"
         ),
     )
