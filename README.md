@@ -52,6 +52,13 @@ docker run -p 8000:8000 -v "$PWD/data:/data" forensic-timeline-api
 | POST | `/scenarios/{id}/versions` | 追加新版本 |
 | POST | `/scenarios/{id}/reconcile?version=&budget_s=&top_k=` | 校核已存版本 |
 | POST | `/compare?budget_s=` | 比较内联/已存的两个方案（含关联规则、分段方案与时区/fold 差异） |
+| POST | `/evidence/packages/precheck` | 证据包预检（不写入）：复算确定性根哈希并返回全部结构化冲突位置 |
+| POST | `/evidence/packages` | 证据包入库（全条件通过才接入主链，201；内容类错误 422、链冲突 409） |
+| GET | `/evidence/chain/head` | 主链链头（版本、根哈希、包总数） |
+| GET | `/evidence/packages` | 按接入顺序列出全部证据包版本 |
+| GET | `/evidence/packages/{version}` | 包详情：逐层 Merkle、交接哈希链、逐文件包含证明 |
+| GET | `/evidence/packages/{version}/diff/{other}` | 两版本对比：文件仅左/仅右/内容变化、交接序号区间（含输入位置） |
+| GET | `/evidence/packages/{version}/proof?path=` | 单文件包含证明：查询路径做 NFC 归一后逐层复算并验证包根 |
 
 ### 请求示例
 
@@ -259,6 +266,72 @@ docker run -p 8000:8000 -v "$PWD/data:/data" forensic-timeline-api
    截断时报告稳定状态；逐事件返回候选 UTC、采用的偏移与选择依据。
 8. 每项计算结果（`Quantity`）都带 **单位、来源/锚点/事件 ID 与 `derived_by`
    推导路径**。
+
+## 证据保全包（Merkle 树 + 交接哈希链）
+
+案件材料在采集、移交、重新封装后，需要逐文件确认与最初接收的证据一致。
+证据包提交 `version`（包版本）、`previous_root_hash`（前序根哈希）、
+`files[]`（路径、声明大小、SHA-256 摘要、Base64 内容）与 `handovers[]`
+（交接序号、带时区时刻、经办人）。处理流水线是**确定性**的，同一请求
+预检与入库复算结果永远一致：
+
+1. 路径做 Unicode **NFC** 规范化；逐字符检查**越界**（拒绝绝对路径、
+   Windows 盘符与反斜杠、`..` 分量、空分量/首尾分隔符、NUL 与控制字符），
+   并检查归一后路径两两**不碰撞**；
+2. 文件按归一后路径的 **UTF-8 字节序**排序；
+3. 每个文件的 `{"path","size","digest"}` 以 canonical JSON
+   （键排序、紧凑分隔、UTF-8、不转义非 ASCII）编码，叶子哈希
+   `leaf = SHA256(0x00 ‖ canonical)`；
+4. Merkle 树自叶子向上两两哈希 `node = SHA256(0x01 ‖ left ‖ right)`，
+   奇数个节点时最后一个直接提升；域前缀抵抗叶子/内部节点的第二原像混淆；
+5. 交接记录按序号构成哈希链
+   `hᵢ = SHA256(0x02 ‖ canonical{seq,timestamp,handler,note,prev_hash})`，
+   虚根为 64 个 `0`；时刻归一为 UTC（`Z`）；
+6. 包根哈希
+   `root = SHA256(0x03 ‖ canonical{version,previous_root_hash,merkle_root,
+   handover_head_hash})`，创世包的 `previous_root_hash` 传 `null`
+   （编码时为 64 个 `0`）。
+
+接入单主链前的全部条件：声明 `size` 必须等于 Base64 解码后的实际字节数，
+声明 `digest` 必须等于内容的 SHA-256；缺件（未给内容）、非法 Base64、
+摘要/大小不符、路径碰撞或越界、文件数或总字节数超容量（环境变量
+`EVIDENCE_MAX_FILES`，默认 10000；`EVIDENCE_MAX_TOTAL_BYTES`，
+默认 256 MiB）一律拒收；交接序号在**全链范围**连续（首包从 1 开始，
+后续承接前包末条 +1），时刻包内单调不减且不得早于前包末次交接；
+前序根哈希必须是主链上的已知包（断链拒收），且每个版本只能有一个后继
+（双重后继拒收），包版本标识全链唯一，主链已有创世包后不得再提交无
+前序根的包。任一条件不满足都**不写入**，并返回
+`{accepted:false, errors:[{code,message,location,expected,actual,location2}]}`，
+一次列出全部冲突及输入位置（如 `files[2].digest`、路径碰撞的另一方
+`location2`）；内容类错误为 HTTP 422，断链/双重后继/重复版本/创世冲突
+为 409。入库在 SQLite `BEGIN IMMEDIATE` 写事务内重建链快照后复算，
+消除“预检通过后主链被他人推进”的并发窗口。
+
+预检示例请求：
+
+```json
+{
+  "version": "pkg-2026-09-15-01",
+  "previous_root_hash": null,
+  "files": [
+    {"path": "docs/笔录.txt", "size": 12,
+     "digest": "3f1b…（64 位十六进制）",
+     "content_base64": "6K+v5a6X56yq5pW4…"}
+  ],
+  "handovers": [
+    {"seq": 1, "timestamp": "2026-09-15T08:00:00+08:00",
+     "handler": "张警官", "note": "初次接收"}
+  ]
+}
+```
+
+成功响应（预检 `accepted=true`、入库 HTTP 201）携带确定性 `root_hash`、
+逐层 `merkle_levels`、每个文件从叶子到根的 `proof`（提升层兄弟为 `null`）、
+交接链哈希、接入后的 `chain_head` 以及每个文件的 `input_index`
+（原请求下标）/`sorted_index`（字节序下标）。`GET …/proof` 用逐层兄弟
+节点**独立重算**根哈希并在响应中给出 `verified`，对任一层哈希或根的
+篡改都会使 `verified=false`。版本对比接口返回仅左/仅右/内容变化文件
+（均带两侧输入位置）与交接序号、时刻区间。
 
 ## 测试
 

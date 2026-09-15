@@ -14,6 +14,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from . import __version__
+from .evidence_api import router as evidence_router
 from .engine import ScenarioValidationError, diff_plans, reconcile
 from .models import (
     PlanDifference,
@@ -33,6 +34,8 @@ app = FastAPI(
         "线性漂移与“先于/同一事件/至少/至多间隔”约束，求解统一时间线；"
         "不可行时给出最小矛盾链，并提供限定修正幅度的偏移建议与方案差异比较。"
         "**所有持续时间均以秒为单位，统一时间轴为 UTC。**"
+        "另提供证据保全包：NFC 路径规范化、canonical JSON + SHA-256 Merkle 树、"
+        "交接哈希链与单主链版本管理，支持预检、入库、版本对比与单文件包含证明。"
     ),
 )
 
@@ -304,3 +307,6 @@ def compare(body: CompareBody) -> PlanDifference:
     except ScenarioValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return diff_plans(left_r, right_r, left_ref, right_ref, left_s, right_s)
+
+
+app.include_router(evidence_router)
