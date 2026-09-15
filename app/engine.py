@@ -75,6 +75,26 @@ def validate_scenario(scenario: Scenario) -> None:
             pass
     constraint_ids = {c.id for c in scenario.constraints}
     seen.clear()
+    seg_sources: set[str] = set()
+    for rule in scenario.clock_segments:
+        if rule.source_id in seg_sources:
+            errs.append(f"来源 {rule.source_id} 声明了多条分段时钟规则")
+        seg_sources.add(rule.source_id)
+        if not any(s.id == rule.source_id for s in scenario.sources):
+            errs.append(f"分段规则引用了不存在的来源 {rule.source_id}")
+        seg_ids: set[str] = set()
+        for seg in rule.segments:
+            if seg.id in seg_ids:
+                errs.append(
+                    f"来源 {rule.source_id} 的时钟段 ID 重复：{seg.id}"
+                )
+            seg_ids.add(seg.id)
+        if not rule.segments and rule.jump_threshold_s is None and scenario.auto_jump_threshold_s is None:
+            errs.append(
+                f"来源 {rule.source_id} 的分段规则必须显式声明时钟段，或给出 "
+                "jump_threshold_s / 场景 auto_jump_threshold_s"
+            )
+    seen.clear()
     for g in scenario.association_groups:
         if g.id in seen:
             errs.append(f"关联组 ID 重复：{g.id}")
@@ -147,8 +167,12 @@ def _build_timeline(
     idx: dict[str, int],
     lower: list[float],
     upper: list[float],
+    segment_candidates: Optional[dict[str, list[str]]] = None,
+    assigned_segments: Optional[dict[str, str]] = None,
 ) -> list[EventWindow]:
     """由差分系统求得的每事件最早/最晚时刻组装统一时间线。"""
+    segment_candidates = segment_candidates or {}
+    assigned_segments = assigned_segments or {}
     timeline: list[EventWindow] = []
     for iv in intervals:
         i = idx[iv.event_id]
@@ -191,6 +215,8 @@ def _build_timeline(
                 representative=format_iso(mid),
                 width_s=q_w,
                 source_id=iv.source_id,
+                segment_ids=segment_candidates.get(iv.event_id, iv.quantity.segment_ids),
+                assigned_segment_id=assigned_segments.get(iv.event_id),
             )
         )
     return timeline
@@ -259,6 +285,13 @@ def _contradiction(
     anchors = sorted(
         {a for iv in intervals if iv.source_id in sources for a in iv.quantity.anchor_ids}
     )
+    seg_ids = sorted(
+        {
+            sid
+            for eid in related_events
+            for sid in iv_by_id[eid].quantity.segment_ids
+        }
+    )
     chain = " → ".join(cycle_events + [cycle_events[0]] if cycle_events else [])
     edge_desc = []
     for e in cycle.edges:
@@ -286,7 +319,9 @@ def _contradiction(
             "constraints": sorted(set(cycle_constraints)),
             "sources": sources,
             "anchors": anchors,
+            **({"clock_segments": seg_ids} if seg_ids else {}),
         },
+        segment_ids=seg_ids,
         explanation=explanation,
     )
 
@@ -573,16 +608,147 @@ def reconcile(
         models, reports, cw, fit_errors = build_clock_models(
             scenario.sources, scenario.anchors, scenario.events, scenario.default_utc_offset_s
         )
-        warnings.extend(cw)
-        intervals, ew = convert_events(
+        legacy_intervals, ew = convert_events(
             scenario.sources, scenario.events, models, scenario.default_utc_offset_s
         )
-        warnings.extend(ew)
     except (TimeParseError, ClockModelError) as exc:
         raise ScenarioValidationError(str(exc)) from exc
     if fit_errors:
         raise ScenarioValidationError("；".join(fit_errors))
 
+    # 分段时钟路径：声明了 clock_segments 时，分段来源的事件区间由分段模型接管，
+    # 其余来源沿用单线性区间；未声明时行为与旧版本完全一致。
+    if scenario.clock_segments:
+        from .segments import run_segmentation
+
+        try:
+            seg_report, primary, nominal_best, sw = run_segmentation(
+                scenario, legacy_intervals, models
+            )
+        except (TimeParseError, ClockModelError) as exc:
+            raise ScenarioValidationError(str(exc)) from exc
+        warnings.extend(cw)
+        warnings.extend(ew)
+        warnings.extend(sw)
+        # 分段来源的单线性拟合类警告（漂移过大/无锚点等）以分段报告为准；
+        # naive 时间戳解析警告（含“无时区”）保留
+        seg_source_ids = set(seg_report.segmented_sources)
+        deduped: list[str] = []
+        for w in warnings:
+            if (
+                "无时区" not in w
+                and any(w.startswith(f"来源 {sid} ") for sid in seg_source_ids)
+            ):
+                continue
+            if w not in deduped:
+                deduped.append(w)
+        warnings = deduped
+
+        chosen = seg_report.schemes[0] if seg_report.schemes else None
+        # 归段依据：采用排名 1 方案的全部事件归属；模糊事件的多个可行归属另行收集
+        candidate_map: dict[str, list[str]] = {}
+        assigned_map: dict[str, str] = {}
+        if chosen:
+            for a in chosen.assignments:
+                prefix = f"{a.source_id}:" if a.source_id else ""
+                assigned_map[a.event_id] = f"{prefix}{a.assigned_segment_id}"
+                if a.ambiguous:
+                    candidate_map[a.event_id] = [
+                        f"{prefix}{s}" for s in a.feasible_segment_ids
+                    ]
+
+        if primary is not None:
+            intervals = primary
+            n, idx, edges = build_graph(intervals, scenario.constraints)
+            iv_by_id = {iv.event_id: iv for iv in intervals}
+            ev_source: dict[int, Optional[str]] = {0: None}
+            for eid, node in idx.items():
+                ev_source[node] = iv_by_id[eid].source_id
+            try:
+                lower, upper = solve(n, edges)
+            except DCSInfeasible as exc:
+                # 理论上不应发生（搜索已校核），仍给出稳健回退
+                contradiction = _contradiction(exc.cycle, idx, intervals, scenario.constraints)
+                result = ReconcileResult(
+                    scenario_name=scenario.name,
+                    feasible=False,
+                    clock_models=list(reports.values()),
+                    event_intervals=intervals,
+                    contradiction=contradiction,
+                    segmentation=seg_report,
+                    warnings=warnings,
+                )
+                _attach_association(
+                    result, scenario, intervals,
+                    assoc_top_k, assoc_max_hypotheses, assoc_max_search_nodes,
+                )
+                return result
+            result = ReconcileResult(
+                scenario_name=scenario.name,
+                feasible=True,
+                unified_timeline=_build_timeline(
+                    intervals, idx, lower, upper,
+                    segment_candidates=candidate_map or None,
+                    assigned_segments=assigned_map,
+                ),
+                clock_models=list(reports.values()),
+                event_intervals=intervals,
+                constraint_slack=_build_slack(edges, scenario.constraints, lower, upper),
+                segmentation=seg_report,
+                warnings=warnings,
+            )
+            if budget_s is not None:
+                result.adjustment = _compute_adjustments(
+                    scenario, n, edges, intervals, scenario.constraints,
+                    ev_source, budget_s, currently_feasible=True,
+                )
+                for adj in result.adjustment.adjustments:
+                    if adj.source_id in reports:
+                        adj.clock_model_offset_s = reports[adj.source_id].offset_s.value
+            _attach_association(
+                result, scenario, intervals,
+                assoc_top_k, assoc_max_hypotheses, assoc_max_search_nodes,
+            )
+            return result
+
+        # 所有分段方案都不可行：用排名最高方案的名义区间描述矛盾与调整建议
+        intervals = nominal_best or legacy_intervals
+        n, idx, edges = build_graph(intervals, scenario.constraints)
+        iv_by_id = {iv.event_id: iv for iv in intervals}
+        ev_source = {0: None}
+        for eid, node in idx.items():
+            ev_source[node] = iv_by_id[eid].source_id
+        # 重新求解以提取负环（区间来自名义归段）
+        contradiction: Optional[Contradiction] = chosen.contradiction if chosen else None
+        try:
+            solve(n, edges)
+        except DCSInfeasible as exc:
+            contradiction = _contradiction(exc.cycle, idx, intervals, scenario.constraints)
+        result = ReconcileResult(
+            scenario_name=scenario.name,
+            feasible=False,
+            clock_models=list(reports.values()),
+            event_intervals=intervals,
+            contradiction=contradiction,
+            segmentation=seg_report,
+            warnings=warnings,
+        )
+        result.adjustment = _compute_adjustments(
+            scenario, n, edges, intervals, scenario.constraints,
+            ev_source, budget_s, currently_feasible=False,
+        )
+        for adj in result.adjustment.adjustments:
+            if adj.source_id in reports:
+                adj.clock_model_offset_s = reports[adj.source_id].offset_s.value
+        _attach_association(
+            result, scenario, intervals,
+            assoc_top_k, assoc_max_hypotheses, assoc_max_search_nodes,
+        )
+        return result
+
+    warnings.extend(cw)
+    warnings.extend(ew)
+    intervals = legacy_intervals
     n, idx, edges = build_graph(intervals, scenario.constraints)
 
     # 事件节点 → 来源（用于偏移建议增广图）
@@ -703,6 +869,71 @@ def diff_plans(
         if lag[gid].model_dump() != rag[gid].model_dump()
     )
 
+    # ---- 分段时钟规则差异 ----
+    from .models import SegmentBoundaryChange, SegmentBoundaryMove
+    from .timescale import parse_unix as _parse_unix
+
+    lseg = {r.source_id: r for r in left_scenario.clock_segments}
+    rseg = {r.source_id: r for r in right_scenario.clock_segments}
+    seg_only_left = sorted(set(lseg) - set(rseg))
+    seg_only_right = sorted(set(rseg) - set(lseg))
+    seg_rules_changed: list[str] = []
+    boundary_changes: list[SegmentBoundaryChange] = []
+    for sid in sorted(set(lseg) & set(rseg)):
+        lr, rr = lseg[sid], rseg[sid]
+        if lr.model_dump() != rr.model_dump():
+            seg_rules_changed.append(sid)
+        lsrc = next((s for s in left_scenario.sources if s.id == sid), None)
+        rsrc = next((s for s in right_scenario.sources if s.id == sid), None)
+        lb = {s.id: s for s in lr.segments}
+        rb = {s.id: s for s in rr.segments}
+        added = sorted(set(rb) - set(lb))
+        removed = sorted(set(lb) - set(rb))
+        moves: list[SegmentBoundaryMove] = []
+        for bid in sorted(set(lb) & set(rb)):
+            lseg_model, rseg_model = lb[bid], rb[bid]
+            off = (lsrc.declared_utc_offset_s if lsrc else 0.0)
+            roff = (rsrc.declared_utc_offset_s if rsrc else 0.0)
+            lt = _parse_unix(lseg_model.start_clock_reading, off)[0]
+            rt = _parse_unix(rseg_model.start_clock_reading, roff)[0]
+            if (
+                abs(rt - lt) > 1e-9
+                or abs(lseg_model.boundary_uncertainty_s - rseg_model.boundary_uncertainty_s) > 1e-9
+            ):
+                moves.append(
+                    SegmentBoundaryMove(
+                        source_id=sid,
+                        segment_id=bid,
+                        left_clock_reading=lseg_model.start_clock_reading,
+                        right_clock_reading=rseg_model.start_clock_reading,
+                        delta_s=rt - lt,
+                        left_boundary_uncertainty_s=lseg_model.boundary_uncertainty_s,
+                        right_boundary_uncertainty_s=rseg_model.boundary_uncertainty_s,
+                    )
+                )
+        threshold_changed = lr.jump_threshold_s != rr.jump_threshold_s or (
+            left_scenario.auto_jump_threshold_s != right_scenario.auto_jump_threshold_s
+            and lr.jump_threshold_s is None and rr.jump_threshold_s is None
+        )
+        if added or removed or moves or threshold_changed:
+            boundary_changes.append(
+                SegmentBoundaryChange(
+                    source_id=sid,
+                    segments_added=added,
+                    segments_removed=removed,
+                    moves=moves,
+                    threshold_changed=threshold_changed,
+                )
+            )
+
+    best_scheme_left = left.segmentation.best_scheme_key if left.segmentation else None
+    best_scheme_right = right.segmentation.best_scheme_key if right.segmentation else None
+    best_scheme_changed = (
+        best_scheme_left is not None
+        and best_scheme_right is not None
+        and best_scheme_left != best_scheme_right
+    )
+
     def _assoc_summary(r: ReconcileResult) -> tuple[Optional[int], Optional[float]]:
         if r.association is None:
             return None, None
@@ -731,6 +962,13 @@ def diff_plans(
         hypotheses_right=hyp_r,
         best_cost_left=cost_l,
         best_cost_right=cost_r,
+        segment_sources_only_left=seg_only_left,
+        segment_sources_only_right=seg_only_right,
+        segment_rules_changed=seg_rules_changed,
+        segment_boundary_moves=boundary_changes,
+        best_scheme_left=best_scheme_left,
+        best_scheme_right=best_scheme_right,
+        best_scheme_changed=best_scheme_changed,
         event_window_deltas_s=deltas,
         feasible_left=left.feasible,
         feasible_right=right.feasible,
@@ -740,6 +978,9 @@ def diff_plans(
             "event_window_deltas_s 中各量为右方案相对左方案的秒级差值（右-左）；"
             "宽度差为正表示右方案该事件的可行时刻范围更宽；"
             "association_groups_* 比较两侧声明的候选关联规则，"
-            "hypotheses_*/best_cost_* 为各自关联求解返回的假设数与最优假设总代价"
+            "hypotheses_*/best_cost_* 为各自关联求解返回的假设数与最优假设总代价；"
+            "segment_sources_*/segment_rules_changed/segment_boundary_moves 比较两侧"
+            "分段时钟规则的新增、删除与边界移动，best_scheme_* 为各自代表分段方案键"
+            "（best_scheme_changed 表示跳变边界组合或最佳方案发生变化）"
         ),
     )

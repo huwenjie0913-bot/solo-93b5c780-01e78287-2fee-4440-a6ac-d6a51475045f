@@ -329,6 +329,32 @@ def build_clock_models(
     return models, reports, warnings, errors
 
 
+def invert_event_interval(
+    ev: Event,
+    source: SourceClock,
+    model: FittedClock,
+) -> tuple[float, float, float, str, list[str]]:
+    """把一个有来源事件按给定拟合模型换算为统一时间区间。
+
+    返回 (lo, hi, 半宽, 推导方法, 警告)；不构造 ``Quantity``，便于分段
+    时钟模型在多段归属间复用同一换算逻辑。
+    """
+    clock_t, aware = parse_unix(ev.reading, source.declared_utc_offset_s)
+    center, half = model.invert(clock_t, ev.reading_uncertainty_s)
+    warn = ""
+    if not aware:
+        warn = (
+            f"事件 {ev.id}（来源 {ev.source_id}）读数无时区，"
+            f"按来源声明偏移 {source.declared_utc_offset_s:g}s 解释"
+        )
+    method = (
+        "timescale.invert_ols" if model.n >= 2
+        else "timescale.invert_single_anchor" if model.n == 1
+        else "timescale.invert_uncalibrated"
+    )
+    return center - half, center + half, half, method, warn
+
+
 def convert_events(
     sources: list[SourceClock],
     events: list[Event],
@@ -361,19 +387,10 @@ def convert_events(
         if ev.source_id not in src_by_id:
             raise ClockModelError(f"事件 {ev.id} 引用了不存在的来源 {ev.source_id}")
         source = src_by_id[ev.source_id]
-        clock_t, aware = parse_unix(ev.reading, source.declared_utc_offset_s)
         model = models[ev.source_id]
-        center, half = model.invert(clock_t, ev.reading_uncertainty_s)
-        if not aware:
-            warnings.append(
-                f"事件 {ev.id}（来源 {ev.source_id}）读数无时区，"
-                f"按来源声明偏移 {source.declared_utc_offset_s:g}s 解释"
-            )
-        method = (
-            "timescale.invert_ols" if model.n >= 2
-            else "timescale.invert_single_anchor" if model.n == 1
-            else "timescale.invert_uncalibrated"
-        )
+        lo, hi, half, method, warn = invert_event_interval(ev, source, model)
+        if warn:
+            warnings.append(warn)
         detail_parts = [
             f"钟面读数按来源 {ev.source_id} 模型反演（a={model.intercept:.3f}s, "
             f"β={model.beta:.9g}）",
@@ -394,8 +411,8 @@ def convert_events(
             EventIntervalInput(
                 event_id=ev.id,
                 source_id=ev.source_id,
-                lo=center - half,
-                hi=center + half,
+                lo=lo,
+                hi=hi,
                 quantity=q,
             )
         )

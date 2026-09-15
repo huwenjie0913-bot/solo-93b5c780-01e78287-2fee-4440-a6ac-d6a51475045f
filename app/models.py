@@ -38,6 +38,49 @@ class SourceClock(BaseModel):
     )
 
 
+class ClockSegment(BaseModel):
+    """一个时钟段：自某钟面时刻起对该来源时钟生效的独立模型。
+
+    设备重启、人工校时、断电后时钟可能跳变；每段独立拟合偏移与漂移，
+    事件按钟面读数归入对应段。``start_clock_reading`` 为该段生效的钟面
+    时刻（按来源 ``declared_utc_offset_s`` 解释）；第一段视为初始段，
+    覆盖早于其生效时刻的读数。``boundary_uncertainty_s`` 给出边界时刻的
+    不确定半宽：钟面读数落在边界 ± 该半宽内的事件保留跨段候选归属。
+    """
+
+    id: str = Field(..., description="来源内唯一的时钟段 ID，如 seg-boot-1")
+    start_clock_reading: str = Field(..., description="本段生效的钟面时刻，ISO 8601（按来源声明偏移解释）")
+    boundary_uncertainty_s: float = Field(
+        0.0, ge=0.0, description="段边界钟面时刻的不确定半宽（秒），区内事件保留多个可行归属"
+    )
+    note: Optional[str] = None
+
+
+class SourceSegmentation(BaseModel):
+    """单个来源的分段时钟规则。
+
+    可显式声明 ``segments``（按生效钟面时刻排序，第一段为初始段）；
+    也可给出 ``jump_threshold_s``，由连续锚点对单线性拟合的残差跳变
+    （|Δ残差| ≥ 阈值）自动生成跳变候选边界并枚举分段方案。二者可同时
+    给出：自动检测到的边界与显式边界组合成候选方案集合。
+    """
+
+    source_id: str = Field(..., description="适用的时钟来源 ID")
+    segments: list[ClockSegment] = Field(
+        default_factory=list, description="显式声明的时钟段（第一段为初始段）"
+    )
+    jump_threshold_s: Optional[float] = Field(
+        None,
+        ge=0.0,
+        description="自动检测阈值（秒）：连续锚点残差跳变不小于该值时生成跳变候选；缺省用场景级阈值",
+    )
+    auto_boundary_uncertainty_s: float = Field(
+        0.0,
+        ge=0.0,
+        description="自动检测边界的额外不确定半宽（秒，另叠加相邻锚点参考不确定度）",
+    )
+
+
 class CalibrationAnchor(BaseModel):
     """校时锚点：同一时刻下“来源时钟读数”与“参考真实时刻”的对应关系。"""
 
@@ -140,6 +183,25 @@ class Scenario(BaseModel):
         default_factory=list,
         description="候选事件关联组；缺省为空，行为与旧版本完全一致",
     )
+    clock_segments: list[SourceSegmentation] = Field(
+        default_factory=list,
+        description=(
+            "分段时钟规则（重启/校时/断电跳变）；可按来源显式声明带生效钟面时刻的"
+            "时钟段，或给出残差阈值自动生成跳变候选。缺省为空，全部来源继续使用"
+            "原有单线性时钟模型"
+        ),
+    )
+    auto_jump_threshold_s: Optional[float] = Field(
+        None,
+        ge=0.0,
+        description=(
+            "场景级自动跳变检测阈值（秒）：来源规则未给 jump_threshold_s 时回退到该值；"
+            "为 null 且来源未给阈值时不做自动检测"
+        ),
+    )
+    max_segment_schemes: int = Field(
+        32, ge=1, le=256, description="分段方案枚举数上限（按排序键保留最优候选）"
+    )
 
 
 # ----------------------------- 输出模型 -----------------------------
@@ -152,6 +214,9 @@ class Quantity(BaseModel):
     unit: str = Field(..., description="单位，如 s / ppm / iso8601")
     source_ids: list[str] = Field(default_factory=list, description="关联的来源 ID")
     anchor_ids: list[str] = Field(default_factory=list, description="关联的锚点 ID")
+    segment_ids: list[str] = Field(
+        default_factory=list, description="关联的时钟段 ID（分段时钟模型）"
+    )
     event_ids: list[str] = Field(default_factory=list, description="关联的事件 ID")
     derived_by: str = Field(..., description="推导方法标识")
     detail: Optional[str] = Field(None, description="人可读推导说明")
@@ -165,6 +230,13 @@ class EventWindow(BaseModel):
     representative: str = Field(..., description="建议采用的统一时刻（区间中点），ISO 8601")
     width_s: Quantity
     source_id: Optional[str]
+    segment_ids: list[str] = Field(
+        default_factory=list,
+        description="该事件可行归属的时钟段 ID（分段时钟模型，且有多个可行归属时 >1 个）",
+    )
+    assigned_segment_id: Optional[str] = Field(
+        None, description="代表方案实际采用的时钟段 ID（单线性模型为 null）"
+    )
 
 
 class ConstraintSlack(BaseModel):
@@ -187,7 +259,11 @@ class Contradiction(BaseModel):
     total_slack_s: float = Field(..., description="环上约束余量之和（<0，超出量）")
     related_record_ids: dict[str, list[str]] = Field(
         default_factory=dict,
-        description="关联的原始记录：events / constraints / sources / anchors",
+        description="关联的原始记录：events / constraints / sources / anchors / clock_segments",
+    )
+    segment_ids: list[str] = Field(
+        default_factory=list,
+        description="矛盾链涉及的时钟段 ID（分段时钟模型；单线性模型为空）",
     )
     explanation: str
 
@@ -348,6 +424,140 @@ class AssociationResult(BaseModel):
     method: str
 
 
+# ----------------------------- 分段时钟模型 -----------------------------
+
+
+class SegmentClockModel(BaseModel):
+    """单个时钟段的独立拟合结果。"""
+
+    source_id: str
+    segment_id: str = Field(..., description="时钟段 ID（方案内唯一）")
+    start_clock_reading: str = Field(..., description="本段生效的钟面时刻，ISO 8601")
+    start_clock_unix_s: float = Field(..., description="本段生效钟面时刻（按来源声明偏移换算的 Unix 秒）")
+    origin: Literal["declared", "auto"] = Field(
+        ..., description="边界来源：显式声明 / 锚点残差自动检测"
+    )
+    boundary_uncertainty_s: float = Field(..., description="边界不确定半宽（秒）")
+    offset_s: Quantity = Field(..., description="参考历元处 clock - true 的偏移（秒）")
+    drift_ppm: Quantity = Field(..., description="本段线性漂移率（ppm，clock 相对 true）")
+    jump_s: Optional[float] = Field(
+        None,
+        description=(
+            "相对上一段在边界处的跳变量（秒）：同一真实时刻下本段钟面与前段钟面之差，"
+            "正值=跳变后钟被向前拨；初始段或证据不足为 null"
+        ),
+    )
+    jump_residual_s: Optional[float] = Field(
+        None, description="自动检测边界处相邻锚点的单线性残差跳变 |Δ残差|（秒）"
+    )
+    reference_epoch: str
+    anchor_count: int = Field(..., description="归入本段、参与拟合的锚点数")
+    anchor_ids: list[str] = Field(default_factory=list, description="归入本段的锚点 ID")
+    fit_rms_residual_s: Optional[float] = None
+    extrapolation: bool = Field(
+        False, description="该源是否有事件落在本段锚点覆盖范围之外"
+    )
+    warnings: list[str] = Field(default_factory=list)
+
+
+class SegmentJump(BaseModel):
+    """两个相邻时钟段之间的一次跳变汇总。"""
+
+    source_id: str
+    boundary_segment_id: str = Field(..., description="跳变后段的 ID")
+    at_clock_reading: str = Field(..., description="跳变发生的钟面时刻，ISO 8601")
+    origin: Literal["declared", "auto"]
+    jump_s: Optional[float] = Field(None, description="跳变量（秒），正值=向前拨；证据不足为 null")
+    uncertainty_s: float = Field(..., description="边界不确定半宽（秒）")
+    detail: str
+
+
+class EventSegmentAssignment(BaseModel):
+    """某事件在一个分段方案中的归段依据。"""
+
+    event_id: str
+    source_id: Optional[str]
+    nominal_segment_id: str = Field(..., description="按钟面读数所属的唯一名义段 ID")
+    feasible_segment_ids: list[str] = Field(
+        ..., description="钟面读数落在边界不确定区时保留的全部可行归属段 ID"
+    )
+    assigned_segment_id: str = Field(
+        ..., description="代表（最优）归段解实际采用的段 ID"
+    )
+    ambiguous: bool = Field(..., description="是否存在多个可行归属")
+    basis: str = Field(..., description="人可读的归段依据（钟面时刻、到各边界的距离、采用解）")
+
+
+class SegmentationScheme(BaseModel):
+    """一个候选分段方案：边界选择 + 每段拟合 + 该方案下的求解结论。"""
+
+    key: str = Field(..., description="方案键：按来源排序的边界段 ID 组合，用于 /compare 识别最佳方案变化")
+    rank: int = Field(..., description="按（可行性优先, 拟合残差, 跳变量, 模糊成本）排序后的名次，从 1 开始")
+    segments: list[SegmentClockModel] = Field(default_factory=list)
+    jumps: list[SegmentJump] = Field(default_factory=list)
+    assignments: list[EventSegmentAssignment] = Field(default_factory=list)
+    feasible: bool = Field(..., description="该方案（含全部跨段归属分支）下差分约束是否可满足")
+    chosen: bool = Field(..., description="是否为代表方案（排名最高且可行；全部不可行时取排名最高者）")
+    chosen_assignment: Optional[dict[str, str]] = Field(
+        None, description="代表归段解：模糊事件 ID -> 采用的段 ID"
+    )
+    assignment_branches: int = Field(..., description="跨段归属分支搜索展开的节点数")
+    fit_score_s: float = Field(..., description="方案拟合分：各源锚点残差 RMS 加权（秒，越小越好）")
+    total_abs_jump_s: float = Field(..., description="可估计跳变量绝对值之和（跳变量未知计 0；秒）")
+    ambiguity_cost_s: float = Field(..., description="代表解的跨段归属代价（事件到名义边界的距离之和，秒）")
+    anchor_rms_residual_s: dict[str, float] = Field(
+        default_factory=dict, description="各来源全部锚点在其所属段下的残差 RMS（秒）"
+    )
+    contradiction: Optional[Contradiction] = Field(
+        None, description="该方案不可行时的代表性矛盾链（已标注涉及的段与锚点）"
+    )
+    detail: str
+
+
+class DetectedJumpCandidate(BaseModel):
+    """自动检测出的跳变候选（连续锚点残差分析）。"""
+
+    source_id: str
+    boundary_segment_id: str = Field(..., description="若采纳该跳变，将生成的（跳变后）段 ID")
+    between_anchor_ids: tuple[str, str] = Field(
+        ..., description="残差跳变所夹的两个连续锚点 ID（按真实时刻排序）"
+    )
+    residual_jump_s: float = Field(..., description="单线性拟合下两锚点残差之差（秒）")
+    threshold_s: float = Field(..., description="触发该候选所使用的阈值（秒）")
+    suggested_clock_reading: str = Field(
+        ..., description="建议的段生效钟面时刻（取后一锚点钟面读数），ISO 8601"
+    )
+    estimated_jump_s: Optional[float] = Field(
+        None, description="相邻锚点直接外推估计的跳变量（秒），证据不足为 null"
+    )
+    boundary_uncertainty_s: float = Field(..., description="建议边界的不确定半宽（秒）")
+    detail: str
+
+
+class SegmentationReport(BaseModel):
+    """分段时钟模型校核报告。"""
+
+    status: Literal["ok", "infeasible", "truncated"] = Field(
+        ...,
+        description="ok=至少一个方案可行；infeasible=枚举方案全部不可行；truncated=方案/归属搜索达上限",
+    )
+    segmented_sources: list[str] = Field(default_factory=list, description="启用了分段规则的来源 ID")
+    detected_jumps: list[DetectedJumpCandidate] = Field(
+        default_factory=list, description="残差自动检测到的全部跳变候选（含未触发阈值时为空）"
+    )
+    schemes: list[SegmentationScheme] = Field(
+        default_factory=list, description="按排序键排列的候选分段方案（枚举上限内）"
+    )
+    best_scheme_key: Optional[str] = Field(
+        None, description="代表方案键（与 schemes[].key 同源，供 /compare 比较最佳方案变化）"
+    )
+    schemes_total: int = Field(..., description="实际枚举评估的方案数")
+    schemes_truncated: bool = Field(..., description="方案枚举是否达到 max_segment_schemes 上限")
+    max_schemes: int
+    max_assignment_nodes: int
+    method: str
+
+
 class ReconcileResult(BaseModel):
     scenario_name: str
     feasible: bool
@@ -359,6 +569,9 @@ class ReconcileResult(BaseModel):
     adjustment: Optional[AdjustmentReport] = None
     association: Optional[AssociationResult] = Field(
         None, description="声明了关联组时的候选关联求解结果；未声明为 null"
+    )
+    segmentation: Optional[SegmentationReport] = Field(
+        None, description="声明了分段时钟规则时的分段校核结果；未声明为 null（沿用单线性模型）"
     )
     warnings: list[str] = Field(default_factory=list)
 
@@ -374,6 +587,34 @@ class ScenarioSummary(BaseModel):
 
 class ScenarioVersion(ScenarioSummary):
     payload: Scenario
+
+
+class SegmentBoundaryMove(BaseModel):
+    """一条共有边界的生效钟面时刻移动。"""
+
+    source_id: str
+    segment_id: str
+    left_clock_reading: str
+    right_clock_reading: str
+    delta_s: float = Field(..., description="右方案边界相对左方案的钟面时刻差（秒，右-左）")
+    left_boundary_uncertainty_s: float
+    right_boundary_uncertainty_s: float
+
+
+class SegmentBoundaryChange(BaseModel):
+    """一个来源的分段边界变化：新增/删除的边界与移动的共有边界。"""
+
+    source_id: str
+    segments_added: list[str] = Field(
+        default_factory=list, description="仅右方案声明的边界段 ID（新增）"
+    )
+    segments_removed: list[str] = Field(
+        default_factory=list, description="仅左方案声明的边界段 ID（删除）"
+    )
+    moves: list[SegmentBoundaryMove] = Field(
+        default_factory=list, description="两侧共有段（按 ID 匹配）的生效时刻移动"
+    )
+    threshold_changed: bool = Field(False, description="自动检测阈值是否变化")
 
 
 class PlanDifference(BaseModel):
@@ -407,6 +648,27 @@ class PlanDifference(BaseModel):
     )
     best_cost_right: Optional[float] = Field(
         None, description="右方案最优假设总代价（无可行假设为 null）"
+    )
+    segment_sources_only_left: list[str] = Field(
+        default_factory=list, description="仅左方案声明了分段时钟规则的来源 ID"
+    )
+    segment_sources_only_right: list[str] = Field(
+        default_factory=list, description="仅右方案声明了分段时钟规则的来源 ID"
+    )
+    segment_rules_changed: list[str] = Field(
+        default_factory=list, description="两侧都声明了分段规则但定义不同的来源 ID"
+    )
+    segment_boundary_moves: list[SegmentBoundaryChange] = Field(
+        default_factory=list, description="两侧共有边界的新增/删除/生效时刻移动"
+    )
+    best_scheme_left: Optional[str] = Field(
+        None, description="左方案代表分段方案键（无分段规则为 null）"
+    )
+    best_scheme_right: Optional[str] = Field(
+        None, description="右方案代表分段方案键（无分段规则为 null）"
+    )
+    best_scheme_changed: bool = Field(
+        False, description="两侧都存在代表分段方案且方案键不同"
     )
     event_window_deltas_s: dict[str, dict[str, float]] = Field(
         default_factory=dict,
