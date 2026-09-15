@@ -722,6 +722,13 @@ class ScenarioSummary(BaseModel):
 
 class ScenarioVersion(ScenarioSummary):
     payload: Scenario
+    timezone_resolution: Optional[TimezoneReport] = Field(
+        None,
+        description=(
+            "保存该版本时持久化的 IANA 时区解析结果（时区声明、逐事件候选 UTC、"
+            "采用的偏移与 fold、选择依据）；未声明时区的场景与早期版本为 null"
+        ),
+    )
 
 
 class SegmentBoundaryMove(BaseModel):

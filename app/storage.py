@@ -1,4 +1,10 @@
-"""SQLite 场景版本库：场景可复查、可派生新版本。"""
+"""SQLite 场景版本库：场景可复查、可派生新版本。
+
+除场景输入 ``payload`` 外，声明了 IANA 时区的场景在写入时会把当时求得的
+时区解析结果（``TimezoneReport``：逐事件候选 UTC、采用的偏移与 fold、
+选择依据）一并持久化到 ``timezone_resolution`` 列，读取版本即可还原保存时
+采用的解析决策，无需重新校核。早期版本该列为 NULL，读取时返回 null。
+"""
 
 from __future__ import annotations
 
@@ -9,7 +15,7 @@ import time
 import uuid
 from typing import Optional
 
-from .models import Scenario, ScenarioSummary, ScenarioVersion
+from .models import Scenario, ScenarioSummary, ScenarioVersion, TimezoneReport
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS scenarios (
@@ -20,6 +26,7 @@ CREATE TABLE IF NOT EXISTS scenarios (
     parent_version INTEGER,
     note        TEXT,
     payload     TEXT NOT NULL,
+    timezone_resolution TEXT,
     PRIMARY KEY (id, version)
 );
 """
@@ -34,16 +41,29 @@ class Store:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.executescript(_SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """旧库迁移：为 1.2.0 之前创建的表补充 timezone_resolution 列。"""
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(scenarios)")}
+        if "timezone_resolution" not in cols:
+            self._conn.execute(
+                "ALTER TABLE scenarios ADD COLUMN timezone_resolution TEXT"
+            )
 
     def close(self) -> None:
         self._conn.close()
 
     def create(
-        self, scenario: Scenario, scenario_id: Optional[str] = None, note: Optional[str] = None
+        self,
+        scenario: Scenario,
+        scenario_id: Optional[str] = None,
+        note: Optional[str] = None,
+        timezone_resolution: Optional[TimezoneReport] = None,
     ) -> ScenarioVersion:
         sid = scenario_id or uuid.uuid4().hex[:12]
-        return self._insert(sid, 1, scenario, None, note)
+        return self._insert(sid, 1, scenario, None, note, timezone_resolution)
 
     def add_version(
         self,
@@ -51,6 +71,7 @@ class Store:
         scenario: Scenario,
         parent_version: Optional[int] = None,
         note: Optional[str] = None,
+        timezone_resolution: Optional[TimezoneReport] = None,
     ) -> ScenarioVersion:
         latest = self.latest_version(scenario_id)
         if latest is None:
@@ -58,7 +79,7 @@ class Store:
         pv = parent_version if parent_version is not None else latest
         if not self.exists_version(scenario_id, pv):
             raise KeyError(f"父版本 {pv} 不存在")
-        return self._insert(scenario_id, latest + 1, scenario, pv, note)
+        return self._insert(scenario_id, latest + 1, scenario, pv, note, timezone_resolution)
 
     def _insert(
         self,
@@ -67,13 +88,17 @@ class Store:
         scenario: Scenario,
         parent_version: Optional[int],
         note: Optional[str],
+        timezone_resolution: Optional[TimezoneReport],
     ) -> ScenarioVersion:
         created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         payload = scenario.model_dump_json()
+        tz_json = (
+            timezone_resolution.model_dump_json() if timezone_resolution is not None else None
+        )
         self._conn.execute(
-            "INSERT INTO scenarios (id, version, name, created_at, parent_version, note, payload)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (sid, version, scenario.name, created, parent_version, note, payload),
+            "INSERT INTO scenarios (id, version, name, created_at, parent_version, note,"
+            " payload, timezone_resolution) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (sid, version, scenario.name, created, parent_version, note, payload, tz_json),
         )
         self._conn.commit()
         return ScenarioVersion(
@@ -84,6 +109,7 @@ class Store:
             parent_version=parent_version,
             note=note,
             payload=scenario,
+            timezone_resolution=timezone_resolution,
         )
 
     def exists_version(self, scenario_id: str, version: int) -> bool:
@@ -108,6 +134,7 @@ class Store:
         ).fetchone()
         if row is None:
             raise KeyError(f"场景 {scenario_id} 版本 {version} 不存在")
+        tz_raw = row["timezone_resolution"]
         return ScenarioVersion(
             scenario_id=row["id"],
             version=row["version"],
@@ -116,6 +143,9 @@ class Store:
             parent_version=row["parent_version"],
             note=row["note"],
             payload=Scenario(**json.loads(row["payload"])),
+            timezone_resolution=(
+                TimezoneReport(**json.loads(tz_raw)) if tz_raw else None
+            ),
         )
 
     def list_versions(self, scenario_id: str) -> list[ScenarioSummary]:

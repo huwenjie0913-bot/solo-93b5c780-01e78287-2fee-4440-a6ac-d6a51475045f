@@ -21,6 +21,7 @@ from .models import (
     Scenario,
     ScenarioSummary,
     ScenarioVersion,
+    TimezoneReport,
 )
 from .storage import Store
 
@@ -38,6 +39,22 @@ app = FastAPI(
 
 def _store() -> Store:
     return Store(os.environ.get("FORENSIC_DB", os.path.join("data", "forensic.db")))
+
+
+def _timezone_resolution_for_save(scenario: Scenario) -> Optional[TimezoneReport]:
+    """写库前计算时区解析结果（时区声明、候选 UTC、采用偏移/ fold 与依据）。
+
+    未声明 IANA 时区的场景返回 None（不持久化，读取为 null）；声明了时区但
+    场景本身未通过校核校验（如引用不存在的来源）时也返回 None——保持旧行为：
+    非法场景仍可入库，校核接口才报错。解析结果与
+    ``POST /scenarios/{id}/reconcile`` 默认参数下的 ``timezone`` 报告一致。
+    """
+    if not any(s.iana_timezone for s in scenario.sources):
+        return None
+    try:
+        return reconcile(scenario).timezone
+    except ScenarioValidationError:
+        return None
 
 
 # 关联求解搜索上限的查询参数（在 max_hypotheses / max_search_nodes 内返回前 top_k 个假设）
@@ -108,7 +125,12 @@ class AddVersionBody(BaseModel):
 def create_scenario(body: CreateVersionBody) -> ScenarioVersion:
     store = _store()
     try:
-        return store.create(body.scenario, body.scenario_id, body.note)
+        return store.create(
+            body.scenario,
+            body.scenario_id,
+            body.note,
+            timezone_resolution=_timezone_resolution_for_save(body.scenario),
+        )
     finally:
         store.close()
 
@@ -161,7 +183,13 @@ def get_scenario(scenario_id: str, version: Optional[int] = None) -> ScenarioVer
 def add_version(scenario_id: str, body: AddVersionBody) -> ScenarioVersion:
     store = _store()
     try:
-        return store.add_version(scenario_id, body.scenario, body.parent_version, body.note)
+        return store.add_version(
+            scenario_id,
+            body.scenario,
+            body.parent_version,
+            body.note,
+            timezone_resolution=_timezone_resolution_for_save(body.scenario),
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     finally:

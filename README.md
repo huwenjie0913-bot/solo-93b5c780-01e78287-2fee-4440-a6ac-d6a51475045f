@@ -48,7 +48,7 @@ docker run -p 8000:8000 -v "$PWD/data:/data" forensic-timeline-api
 | POST | `/scenarios` | 创建场景（v1，入 SQLite） |
 | GET | `/scenarios` | 列出场景（最新版本） |
 | GET | `/scenarios/{id}/versions` | 列出某场景全部版本 |
-| GET | `/scenarios/{id}?version=` | 读取指定版本（缺省最新） |
+| GET | `/scenarios/{id}?version=` | 读取指定版本（缺省最新），含保存时持久化的 `timezone_resolution` |
 | POST | `/scenarios/{id}/versions` | 追加新版本 |
 | POST | `/scenarios/{id}/reconcile?version=&budget_s=&top_k=` | 校核已存版本 |
 | POST | `/compare?budget_s=` | 比较内联/已存的两个方案（含关联规则、分段方案与时区/fold 差异） |
@@ -122,11 +122,15 @@ docker run -p 8000:8000 -v "$PWD/data:/data" forensic-timeline-api
   同一来源暂不支持同时声明时区与分段规则（校验报错）。声明时区后该来源的
   `declared_utc_offset_s` 被忽略（给出警告）。
 
-时区声明随场景版本一并保存；校核是确定性的，对已存版本重新校核即可复现
-解析决策。`/compare` 通过 `timezones_only_*`、
-`timezone_declarations_changed` 与 `fold_differences` 展示两方案的时区
-声明与 fold 采用差异。未声明 `iana_timezone` 的旧请求行为完全不变
-（`timezone` 为 null）。
+时区声明随场景版本一并保存；写入版本（`POST /scenarios`、`POST
+/scenarios/{id}/versions`）时会把当时的解析结果——逐事件候选 UTC、采用的
+偏移与 fold、选择依据及 `fold_assignments`——作为 `timezone_resolution`
+随版本持久化，`GET /scenarios/{id}?version=` 直接返回保存时的解析决策，
+无需重新校核（与 `POST /scenarios/{id}/reconcile` 默认参数下的 `timezone`
+报告一致；未声明时区或早期版本该字段为 null，仍可正常读取）。`/compare`
+通过 `timezones_only_*`、`timezone_declarations_changed` 与
+`fold_differences` 展示两方案的时区声明与 fold 采用差异。未声明
+`iana_timezone` 的旧请求行为完全不变（`timezone` 为 null）。
 
 ## 候选事件关联求解
 
