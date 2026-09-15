@@ -22,6 +22,11 @@ class SourceClock(BaseModel):
 
     ``declared_utc_offset_s``：该来源原始读数声称所处的 UTC 偏移（秒），
     例如东八区为 28800。仅用于解析 naive 读数，不代表时钟准确。
+    ``iana_timezone``：可选的 IANA 时区名（如 ``America/New_York``）。声明后
+    naive 读数改按 ``zoneinfo`` 时区规则解析：秋季回拨重叠内的读数展开为
+    两个合法 UTC 候选（fold=0/1），由事件约束选取；春季跳时空洞内的读数
+    视为不存在的本地时间。显式偏移读数始终优先，不受该字段影响；
+    未声明时保持固定偏移行为。
     ``drift_ppm``：先验走时漂移量级（ppm，无量纲），无校时锚点时用于
     估计该时钟的外推不确定度。
     """
@@ -30,6 +35,13 @@ class SourceClock(BaseModel):
     name: Optional[str] = Field(None, description="可读名称")
     kind: Optional[str] = Field(None, description="来源类型，如 exif / access_log / device_log")
     declared_utc_offset_s: float = Field(0.0, description="来源读数声称的 UTC 偏移（秒）")
+    iana_timezone: Optional[str] = Field(
+        None,
+        description=(
+            "IANA 时区名（如 America/New_York）；声明后 naive 读数按 zoneinfo "
+            "时区规则解析为全部合法 UTC 候选，显式偏移读数仍优先"
+        ),
+    )
     drift_ppm: float = Field(0.0, ge=0.0, description="先验漂移量级（ppm）")
     base_uncertainty_s: float = Field(
         0.0,
@@ -431,6 +443,115 @@ class AssociationResult(BaseModel):
     method: str
 
 
+# ----------------------------- IANA 时区歧义求解 -----------------------------
+
+
+class TimezoneCandidate(BaseModel):
+    """naive 读数在声明 IANA 时区下的一个合法 UTC 候选。"""
+
+    unix_s: float = Field(..., description="候选 UTC 时刻（Unix 秒）")
+    iso: str = Field(..., description="候选 UTC 时刻，ISO 8601")
+    utc_offset_s: float = Field(..., description="该候选适用的 UTC 偏移（秒）")
+    offset_iso: str = Field(..., description="UTC 偏移的 ISO 8601 表示，如 -04:00")
+    fold: Optional[int] = Field(
+        None,
+        description="PEP 495 fold 标记（0=首次出现/跳时前偏移，1=回拨后再次出现）；显式偏移读数为 null",
+    )
+    tz_rule: str = Field(
+        ..., description="该候选适用的时区规则缩写（zoneinfo tzname），如 EDT / EST / CST"
+    )
+
+
+class EventTimezoneResolution(BaseModel):
+    """单个事件的时区解析结论：全部合法候选 + 代表解采用的偏移与依据。"""
+
+    event_id: str
+    source_id: Optional[str]
+    reading: str = Field(..., description="原始读数字符串")
+    iana_timezone: str = Field(..., description="来源声明的 IANA 时区名")
+    status: Literal["unique", "ambiguous", "gap", "explicit_offset"] = Field(
+        ...,
+        description=(
+            "unique=唯一合法候选；ambiguous=回拨重叠，多个候选由事件约束选取；"
+            "gap=春季跳时空洞，本地时间不存在；explicit_offset=显式偏移读数（时区优先规则不适用）"
+        ),
+    )
+    candidates: list[TimezoneCandidate] = Field(
+        default_factory=list, description="全部合法 UTC 候选（gap 时为空）"
+    )
+    adopted_unix_s: Optional[float] = Field(None, description="代表解采用的 UTC 时刻（Unix 秒）")
+    adopted_utc_offset_s: Optional[float] = Field(None, description="代表解采用的 UTC 偏移（秒）")
+    adopted_fold: Optional[int] = Field(None, description="代表解采用的 fold 标记")
+    basis: str = Field(..., description="人可读的选择依据（含适用时区规则）")
+
+
+class TimezoneSearchStats(BaseModel):
+    """fold 组合分支限界搜索的统计与截断状态。"""
+
+    ambiguous_events: int = Field(..., description="回拨重叠内、需选取 fold 的事件数")
+    combinations_total: int = Field(..., description="理论 fold 组合数（2^ambiguous_events）")
+    nodes_expanded: int = Field(..., description="展开的搜索节点数（含根节点）")
+    branches_pruned: int = Field(..., description="被差分约束校核剪枝的分支数")
+    feasible_combinations: int = Field(
+        ..., description="搜索中发现的可行 fold 组合数（枚举被截断时为已探索范围内的计数）"
+    )
+    max_search_nodes: int
+    truncated: bool
+    truncation_reason: Optional[str] = Field(
+        None, description="截断原因：node_limit（达到节点上限且仍有节点未探索）；未截断为 null"
+    )
+
+
+class TimezoneReport(BaseModel):
+    """IANA 时区歧义求解报告。"""
+
+    status: Literal["ok", "infeasible", "truncated"] = Field(
+        ...,
+        description=(
+            "ok=解析完成且代表 fold 组合可行；infeasible=存在不存在的本地时间（gap）"
+            "或全部 fold 组合均被差分约束排除；truncated=组合搜索达到节点上限"
+        ),
+    )
+    timezone_sources: list[str] = Field(
+        default_factory=list, description="声明了 IANA 时区的来源 ID"
+    )
+    resolutions: list[EventTimezoneResolution] = Field(
+        default_factory=list, description="涉及时区来源事件的逐事件解析结论"
+    )
+    ambiguous_events: list[str] = Field(
+        default_factory=list, description="读数落在回拨重叠内的事件 ID"
+    )
+    gap_events: list[str] = Field(
+        default_factory=list, description="读数为不存在本地时间（春季跳时空洞）的事件 ID"
+    )
+    fold_assignments: dict[str, int] = Field(
+        default_factory=dict, description="代表解实际采用的 fold 组合（事件 ID -> fold）"
+    )
+    stats: TimezoneSearchStats
+    contradiction: Optional[Contradiction] = Field(
+        None,
+        description="gap 或全部组合无解时的矛盾信息（关联原始事件、来源与适用时区规则）",
+    )
+    method: str
+
+
+class FoldDifference(BaseModel):
+    """两方案间同一事件时区解析结论的差异。"""
+
+    event_id: str
+    left_iana_timezone: Optional[str] = None
+    right_iana_timezone: Optional[str] = None
+    left_fold: Optional[int] = None
+    right_fold: Optional[int] = None
+    left_utc_offset_s: Optional[float] = None
+    right_utc_offset_s: Optional[float] = None
+    left_unix_s: Optional[float] = None
+    right_unix_s: Optional[float] = None
+    delta_s: Optional[float] = Field(
+        None, description="两侧均采用时的 UTC 时刻差（右-左，秒）；任一侧未采用为 null"
+    )
+
+
 # ----------------------------- 分段时钟模型 -----------------------------
 
 
@@ -577,6 +698,13 @@ class ReconcileResult(BaseModel):
     association: Optional[AssociationResult] = Field(
         None, description="声明了关联组时的候选关联求解结果；未声明为 null"
     )
+    timezone: Optional[TimezoneReport] = Field(
+        None,
+        description=(
+            "声明了 IANA 时区来源时的时区歧义求解报告（逐事件候选 UTC、采用的 "
+            "fold/偏移与依据）；未声明为 null（沿用固定偏移行为）"
+        ),
+    )
     segmentation: Optional[SegmentationReport] = Field(
         None, description="声明了分段时钟规则时的分段校核结果；未声明为 null（沿用单线性模型）"
     )
@@ -676,6 +804,19 @@ class PlanDifference(BaseModel):
     )
     best_scheme_changed: bool = Field(
         False, description="两侧都存在代表分段方案且方案键不同"
+    )
+    timezones_only_left: list[str] = Field(
+        default_factory=list, description="仅左方案声明了 IANA 时区的来源 ID"
+    )
+    timezones_only_right: list[str] = Field(
+        default_factory=list, description="仅右方案声明了 IANA 时区的来源 ID"
+    )
+    timezone_declarations_changed: list[str] = Field(
+        default_factory=list, description="两侧都声明了 IANA 时区但时区名不同的来源 ID"
+    )
+    fold_differences: list[FoldDifference] = Field(
+        default_factory=list,
+        description="两侧时区解析结论不同的事件（采用的 fold / UTC 偏移 / UTC 时刻差异）",
     )
     event_window_deltas_s: dict[str, dict[str, float]] = Field(
         default_factory=dict,

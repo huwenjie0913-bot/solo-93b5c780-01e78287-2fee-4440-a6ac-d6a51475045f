@@ -39,10 +39,19 @@ class ScenarioValidationError(ValueError):
 def validate_scenario(scenario: Scenario) -> None:
     errs: list[str] = []
     seen: set[str] = set()
+    tz_sources: set[str] = set()
     for s in scenario.sources:
         if s.id in seen:
             errs.append(f"来源 ID 重复：{s.id}")
         seen.add(s.id)
+        if s.iana_timezone:
+            from .timezones import TimezoneResolutionError, load_zone
+
+            try:
+                load_zone(s.iana_timezone)
+            except TimezoneResolutionError as exc:
+                errs.append(f"来源 {s.id} 声明的 IANA 时区无效：{exc}")
+            tz_sources.add(s.id)
     seen.clear()
     for ev in scenario.events:
         if ev.id in seen:
@@ -82,6 +91,11 @@ def validate_scenario(scenario: Scenario) -> None:
         seg_sources.add(rule.source_id)
         if not any(s.id == rule.source_id for s in scenario.sources):
             errs.append(f"分段规则引用了不存在的来源 {rule.source_id}")
+        if rule.source_id in tz_sources:
+            errs.append(
+                f"来源 {rule.source_id} 同时声明 IANA 时区与分段时钟规则，"
+                "暂不支持组合使用（可分别为不同来源声明）"
+            )
         seg_ids: set[str] = set()
         for seg in rule.segments:
             if seg.id in seg_ids:
@@ -601,6 +615,7 @@ def reconcile(
     assoc_top_k: int = 3,
     assoc_max_hypotheses: int = 100,
     assoc_max_search_nodes: int = 10_000,
+    tz_max_search_nodes: int = 10_000,
 ) -> ReconcileResult:
     validate_scenario(scenario)
     warnings: list[str] = []
@@ -615,6 +630,33 @@ def reconcile(
         raise ScenarioValidationError(str(exc)) from exc
     if fit_errors:
         raise ScenarioValidationError("；".join(fit_errors))
+
+    # IANA 时区歧义求解：声明了 iana_timezone 的来源，naive 读数展开为全部合法
+    # UTC 候选，由差分约束选取可行 fold 组合；未声明时区的场景保持固定偏移行为。
+    tz_report = None
+    if any(s.iana_timezone for s in scenario.sources):
+        from .timezones import run_timezone_resolution
+
+        tz_report, tz_intervals, tzw = run_timezone_resolution(
+            scenario, models, legacy_intervals, tz_max_search_nodes
+        )
+        warnings.extend(tzw)
+        if tz_intervals is None:
+            # 不存在的本地时间（春季跳时空洞）或全部 fold 组合均被约束排除：
+            # 事件无法安置到统一时间轴，直接判不可行
+            warnings.extend(cw)
+            warnings.extend(ew)
+            return ReconcileResult(
+                scenario_name=scenario.name,
+                feasible=False,
+                clock_models=list(reports.values()),
+                event_intervals=legacy_intervals,
+                contradiction=tz_report.contradiction,
+                timezone=tz_report,
+                warnings=warnings,
+            )
+        # 代表 fold 组合下的区间替换名义区间，供后续差分求解/分段/关联复用
+        legacy_intervals = tz_intervals
 
     # 分段时钟路径：声明了 clock_segments 时，分段来源的事件区间由分段模型接管，
     # 其余来源沿用单线性区间；未声明时行为与旧版本完全一致。
@@ -675,6 +717,7 @@ def reconcile(
                     clock_models=list(reports.values()),
                     event_intervals=intervals,
                     contradiction=contradiction,
+                    timezone=tz_report,
                     segmentation=seg_report,
                     warnings=warnings,
                 )
@@ -694,6 +737,7 @@ def reconcile(
                 clock_models=list(reports.values()),
                 event_intervals=intervals,
                 constraint_slack=_build_slack(edges, scenario.constraints, lower, upper),
+                timezone=tz_report,
                 segmentation=seg_report,
                 warnings=warnings,
             )
@@ -730,6 +774,7 @@ def reconcile(
             clock_models=list(reports.values()),
             event_intervals=intervals,
             contradiction=contradiction,
+            timezone=tz_report,
             segmentation=seg_report,
             warnings=warnings,
         )
@@ -767,6 +812,7 @@ def reconcile(
             clock_models=list(reports.values()),
             event_intervals=intervals,
             contradiction=contradiction,
+            timezone=tz_report,
             warnings=warnings,
         )
         result.adjustment = _compute_adjustments(
@@ -791,6 +837,7 @@ def reconcile(
         clock_models=list(reports.values()),
         event_intervals=intervals,
         constraint_slack=_build_slack(edges, scenario.constraints, lower, upper),
+        timezone=tz_report,
         warnings=warnings,
     )
     if budget_s is not None:
@@ -934,6 +981,55 @@ def diff_plans(
         and best_scheme_left != best_scheme_right
     )
 
+    # ---- IANA 时区声明与 fold 解析差异 ----
+    from .models import FoldDifference
+
+    ltz = {s.id: s.iana_timezone for s in left_scenario.sources if s.iana_timezone}
+    rtz = {s.id: s.iana_timezone for s in right_scenario.sources if s.iana_timezone}
+    tz_only_left = sorted(set(ltz) - set(rtz))
+    tz_only_right = sorted(set(rtz) - set(ltz))
+    tz_decl_changed = sorted(k for k in set(ltz) & set(rtz) if ltz[k] != rtz[k])
+
+    def _resolution_map(r: ReconcileResult) -> dict[str, tuple]:
+        if r.timezone is None:
+            return {}
+        return {
+            res.event_id: (
+                res.iana_timezone,
+                res.adopted_fold,
+                res.adopted_utc_offset_s,
+                res.adopted_unix_s,
+            )
+            for res in r.timezone.resolutions
+        }
+
+    lres, rres = _resolution_map(left), _resolution_map(right)
+    fold_diffs: list[FoldDifference] = []
+    for eid in sorted(set(lres) | set(rres)):
+        l, r = lres.get(eid), rres.get(eid)
+        if l is not None and r is not None and l == r:
+            continue  # 两侧解析结论一致
+        if l is None and r is None:
+            continue
+        # 一侧未声明时区（无解析记录）或两侧采用的 fold/偏移/UTC 不同
+        if l is not None and r is not None and l[0] == r[0] and l[1:] == r[1:]:
+            continue
+        delta = (r[3] - l[3]) if (l is not None and r is not None and l[3] is not None and r[3] is not None) else None
+        fold_diffs.append(
+            FoldDifference(
+                event_id=eid,
+                left_iana_timezone=l[0] if l else None,
+                right_iana_timezone=r[0] if r else None,
+                left_fold=l[1] if l else None,
+                right_fold=r[1] if r else None,
+                left_utc_offset_s=l[2] if l else None,
+                right_utc_offset_s=r[2] if r else None,
+                left_unix_s=l[3] if l else None,
+                right_unix_s=r[3] if r else None,
+                delta_s=delta,
+            )
+        )
+
     def _assoc_summary(r: ReconcileResult) -> tuple[Optional[int], Optional[float]]:
         if r.association is None:
             return None, None
@@ -969,6 +1065,10 @@ def diff_plans(
         best_scheme_left=best_scheme_left,
         best_scheme_right=best_scheme_right,
         best_scheme_changed=best_scheme_changed,
+        timezones_only_left=tz_only_left,
+        timezones_only_right=tz_only_right,
+        timezone_declarations_changed=tz_decl_changed,
+        fold_differences=fold_diffs,
         event_window_deltas_s=deltas,
         feasible_left=left.feasible,
         feasible_right=right.feasible,
@@ -981,6 +1081,9 @@ def diff_plans(
             "hypotheses_*/best_cost_* 为各自关联求解返回的假设数与最优假设总代价；"
             "segment_sources_*/segment_rules_changed/segment_boundary_moves 比较两侧"
             "分段时钟规则的新增、删除与边界移动，best_scheme_* 为各自代表分段方案键"
-            "（best_scheme_changed 表示跳变边界组合或最佳方案发生变化）"
+            "（best_scheme_changed 表示跳变边界组合或最佳方案发生变化）；"
+            "timezones_only_*/timezone_declarations_changed 比较两侧来源的 IANA 时区声明，"
+            "fold_differences 列出两侧时区解析结论不同的事件（采用的 fold、UTC 偏移"
+            "与 UTC 时刻差异，delta_s 为右-左秒级差）"
         ),
     )

@@ -60,6 +60,44 @@ def parse_unix(value: str, fallback_utc_offset_s: float = 0.0) -> tuple[float, b
     return as_utc.timestamp() - fallback_utc_offset_s, False
 
 
+def parse_unix_for_source(value: str, source: SourceClock) -> tuple[float, bool]:
+    """来源感知的 ISO 8601 解析，返回 (unix 秒, 是否带显式时区)。
+
+    显式偏移始终优先；来源声明了 ``iana_timezone`` 时 naive 读数按该 IANA
+    时区做 fold=0 确定性解析（回拨重叠取首次出现，跳时空洞按 PEP 495
+    fold=0 规则），否则回退到来源声明的固定偏移。歧义读数的全部 UTC
+    候选由 ``timezones`` 模块在校核阶段展开，此处仅给出确定性名义值。
+    """
+    if isinstance(value, str) and value.strip():
+        try:
+            dt = datetime.fromisoformat(value.strip())
+        except ValueError:
+            dt = None
+        if dt is not None and dt.tzinfo is not None:
+            return dt.timestamp(), True
+        if dt is not None and source.iana_timezone:
+            from .timezones import resolve_naive_deterministic
+
+            return resolve_naive_deterministic(value, source.iana_timezone), False
+    return parse_unix(value, source.declared_utc_offset_s)
+
+
+def naive_reading_note(source: SourceClock, value: str, *, for_event: bool = False) -> str:
+    """naive 读数解释方式的人可读说明（供警告文本复用）。
+
+    锚点读数按 fold=0 确定性解释；事件读数在声明时区下的全部合法候选
+    由 ``timezones`` 模块在校核阶段展开，此处仅指向报告。
+    """
+    if source.iana_timezone:
+        from .timezones import naive_interpretation_note
+
+        note = naive_interpretation_note(value, source.iana_timezone, nominal=not for_event)
+        if for_event:
+            note += "；该事件全部合法 UTC 候选与最终采用见 timezone 报告"
+        return note
+    return f"按来源声明偏移 {source.declared_utc_offset_s:g}s 解释"
+
+
 def format_iso(unix_seconds: float) -> str:
     """Unix 秒格式化为带 Z 的 UTC ISO 8601 字符串（保留毫秒）。"""
     if not math.isfinite(unix_seconds):
@@ -138,7 +176,7 @@ def _fit_anchors(
     max_ref_unc = 0.0
 
     for anc in anchors:
-        clock_t, aware_c = parse_unix(anc.clock_reading, source.declared_utc_offset_s)
+        clock_t, aware_c = parse_unix_for_source(anc.clock_reading, source)
         true_t, aware_r = parse_unix(anc.reference_time, default_offset_s)
         pts.append((true_t, clock_t))
         max_ref_unc = max(max_ref_unc, anc.reference_uncertainty_s)
@@ -154,7 +192,7 @@ def _fit_anchors(
         if not aware_c:
             warnings.append(
                 f"锚点 {anc.id}（来源 {source.id}）钟面读数无时区，"
-                f"按来源声明偏移 {source.declared_utc_offset_s:g}s 解释"
+                + naive_reading_note(source, anc.clock_reading)
             )
 
     n = len(pts)
@@ -267,7 +305,7 @@ def build_clock_models(
     for ev in events:
         if ev.source_id and ev.source_id in source_ids:
             src = next(s for s in sources if s.id == ev.source_id)
-            t, _ = parse_unix(ev.reading, src.declared_utc_offset_s)
+            t, _ = parse_unix_for_source(ev.reading, src)
             first_event_t.setdefault(ev.source_id, t)
 
     for source in sources:
@@ -281,7 +319,7 @@ def build_clock_models(
             for ev in events:
                 if ev.source_id != source.id:
                     continue
-                ct, _ = parse_unix(ev.reading, source.declared_utc_offset_s)
+                ct, _ = parse_unix_for_source(ev.reading, source)
                 if ct < model.t_span[0] or ct > model.t_span[1]:
                     extrap = True
                     break
@@ -337,15 +375,16 @@ def invert_event_interval(
     """把一个有来源事件按给定拟合模型换算为统一时间区间。
 
     返回 (lo, hi, 半宽, 推导方法, 警告)；不构造 ``Quantity``，便于分段
-    时钟模型在多段归属间复用同一换算逻辑。
+    时钟模型在多段归属间复用同一换算逻辑。声明了 IANA 时区的来源，naive
+    读数此处按 fold=0 名义解析；全部合法候选由 ``timezones`` 模块展开。
     """
-    clock_t, aware = parse_unix(ev.reading, source.declared_utc_offset_s)
+    clock_t, aware = parse_unix_for_source(ev.reading, source)
     center, half = model.invert(clock_t, ev.reading_uncertainty_s)
     warn = ""
     if not aware:
         warn = (
             f"事件 {ev.id}（来源 {ev.source_id}）读数无时区，"
-            f"按来源声明偏移 {source.declared_utc_offset_s:g}s 解释"
+            + naive_reading_note(source, ev.reading, for_event=True)
         )
     method = (
         "timescale.invert_ols" if model.n >= 2

@@ -48,6 +48,9 @@ AssocMaxHypotheses = Query(
 AssocMaxSearchNodes = Query(
     10_000, ge=1, le=1_000_000, description="关联求解展开的搜索节点数上限"
 )
+TzMaxSearchNodes = Query(
+    10_000, ge=1, le=1_000_000, description="IANA 时区 fold 组合搜索展开的节点数上限"
+)
 
 
 @app.get("/health", tags=["系统"])
@@ -71,6 +74,7 @@ def reconcile_endpoint(
     top_k: int = AssocTopK,
     max_hypotheses: int = AssocMaxHypotheses,
     max_search_nodes: int = AssocMaxSearchNodes,
+    tz_max_search_nodes: int = TzMaxSearchNodes,
 ) -> ReconcileResult:
     try:
         return reconcile(
@@ -79,6 +83,7 @@ def reconcile_endpoint(
             assoc_top_k=top_k,
             assoc_max_hypotheses=max_hypotheses,
             assoc_max_search_nodes=max_search_nodes,
+            tz_max_search_nodes=tz_max_search_nodes,
         )
     except ScenarioValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -176,6 +181,7 @@ def reconcile_stored(
     top_k: int = AssocTopK,
     max_hypotheses: int = AssocMaxHypotheses,
     max_search_nodes: int = AssocMaxSearchNodes,
+    tz_max_search_nodes: int = TzMaxSearchNodes,
 ) -> ReconcileResult:
     store = _store()
     try:
@@ -191,6 +197,7 @@ def reconcile_stored(
             assoc_top_k=top_k,
             assoc_max_hypotheses=max_hypotheses,
             assoc_max_search_nodes=max_search_nodes,
+            tz_max_search_nodes=tz_max_search_nodes,
         )
     except ScenarioValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -217,6 +224,9 @@ class CompareBody(BaseModel):
     )
     max_search_nodes: int = Field(
         10_000, ge=1, le=1_000_000, description="两侧关联求解展开的搜索节点数上限"
+    )
+    tz_max_search_nodes: int = Field(
+        10_000, ge=1, le=1_000_000, description="两侧 IANA 时区 fold 组合搜索的节点数上限"
     )
 
 
@@ -253,6 +263,7 @@ def compare(body: CompareBody) -> PlanDifference:
             assoc_top_k=body.top_k,
             assoc_max_hypotheses=body.max_hypotheses,
             assoc_max_search_nodes=body.max_search_nodes,
+            tz_max_search_nodes=body.tz_max_search_nodes,
         )
         right_r = reconcile(
             right_s,
@@ -260,6 +271,7 @@ def compare(body: CompareBody) -> PlanDifference:
             assoc_top_k=body.top_k,
             assoc_max_hypotheses=body.max_hypotheses,
             assoc_max_search_nodes=body.max_search_nodes,
+            tz_max_search_nodes=body.tz_max_search_nodes,
         )
     except ScenarioValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

@@ -3,12 +3,14 @@
 把相机 EXIF、门禁记录、设备日志等**不同时钟来源**的事件，结合校时锚点、
 线性漂移与“先于 / 同一事件 / 至少 / 至多间隔”等约束，求解统一时间线；
 约束无法同时成立时给出**最小矛盾链**与关联原始记录，并提供限定修正幅度的
-**时钟偏移建议**与两个方案的差异比较。门禁刷卡、摄像头抓拍、设备报警等
-只能按时间窗推断是否同一件事的记录，可声明**候选事件关联组**，由求解器
-在容差与代价下搜索最优配对假设。所有持续时间以**秒**为单位，统一时间轴
-为 **UTC Unix 秒**。
+**时钟偏移建议**与两个方案的差异比较。来源可声明 **IANA 时区**，秋季回拨
+重叠内的 naive 读数展开为全部合法 UTC 候选（fold=0/1），由事件约束选取
+可行组合；春季跳时空洞内的读数判为不存在的本地时间。门禁刷卡、摄像头抓拍、
+设备报警等只能按时间窗推断是否同一件事的记录，可声明**候选事件关联组**，
+由求解器在容差与代价下搜索最优配对假设。所有持续时间以**秒**为单位，
+统一时间轴为 **UTC Unix 秒**。
 
-- Python 3.11+ / FastAPI / Pydantic v2
+- Python 3.11+ / FastAPI / Pydantic v2 / zoneinfo + tzdata
 - 场景版本保存在 SQLite，可复查、可派生
 - 无外部数值库依赖：差分约束用 Bellman-Ford / 多源最短路实现
 
@@ -42,14 +44,14 @@ docker run -p 8000:8000 -v "$PWD/data:/data" forensic-timeline-api
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/reconcile?budget_s=&top_k=&max_hypotheses=&max_search_nodes=` | 校核场景，返回统一时间线；带 `budget_s` 时附偏移建议；声明了关联组时附关联假设；声明了 `clock_segments` 时附分段时钟报告 |
+| POST | `/reconcile?budget_s=&top_k=&max_hypotheses=&max_search_nodes=&tz_max_search_nodes=` | 校核场景，返回统一时间线；带 `budget_s` 时附偏移建议；声明了关联组时附关联假设；声明了 `clock_segments` 时附分段时钟报告；声明了 `iana_timezone` 时附时区歧义求解报告 |
 | POST | `/scenarios` | 创建场景（v1，入 SQLite） |
 | GET | `/scenarios` | 列出场景（最新版本） |
 | GET | `/scenarios/{id}/versions` | 列出某场景全部版本 |
 | GET | `/scenarios/{id}?version=` | 读取指定版本（缺省最新） |
 | POST | `/scenarios/{id}/versions` | 追加新版本 |
 | POST | `/scenarios/{id}/reconcile?version=&budget_s=&top_k=` | 校核已存版本 |
-| POST | `/compare?budget_s=` | 比较内联/已存的两个方案（含关联规则差异） |
+| POST | `/compare?budget_s=` | 比较内联/已存的两个方案（含关联规则、分段方案与时区/fold 差异） |
 
 ### 请求示例
 
@@ -88,6 +90,43 @@ docker run -p 8000:8000 -v "$PWD/data:/data" forensic-timeline-api
   （无来源事件回退到场景的 `default_utc_offset_s`），同样**不受进程 `TZ` 影响**；
   响应中会给出“无时区”警告。
 - 统一时间线输出带 `Z` 的 UTC ISO 8601 与 UTC Unix 秒两种表示。
+
+## IANA 时区歧义求解（回拨重叠 / 跳时空洞）
+
+秋季夏令时回拨会让同一设备的本地时间出现两次（如纽约 11 月第一个周日的
+01:00–02:00），固定 UTC 偏移会把取证记录放错一小时；春季跳时则让一段
+本地时间根本不存在。来源可声明 IANA 时区名，由 `zoneinfo` 与随应用安装的
+`tzdata` 求解歧义（与进程 `TZ` 无关）：
+
+```json
+{"id": "cam", "iana_timezone": "America/New_York"}
+```
+
+- **候选展开**：声明时区后，naive 读数按 PEP 495 往返校验展开为全部合法
+  UTC 候选——普通时刻 1 个、回拨重叠 2 个（fold=0/1，偏移相差一小时）、
+  跳时空洞 0 个。显式偏移读数始终优先，不参与展开。
+- **fold 组合搜索**：每个重叠事件的两个候选各生成一组一元区间分支，
+  接入差分约束 + 分支限界（与关联求解同一套 Bellman-Ford 剪枝），由事件
+  约束选出可行的 fold 组合；多个组合均可行时按 fold=0 优先取代表解。
+  `tz_max_search_nodes`（默认 10000）限制展开节点数，达到上限且仍有节点
+  未探索时报告稳定的 `truncated` / `node_limit` 状态。
+- **逐事件结论**：`timezone.resolutions[]` 返回每个涉及时区事件的全部
+  候选 UTC（含偏移与规则缩写，如 EDT/EST）、代表解采用的 fold/偏移与
+  选择依据（另一候选被约束排除还是亦可行）。
+- **矛盾**：本地时间不存在（`gap`）或全部 fold 组合均被约束排除时，
+  `contradiction` 关联原始事件、来源与适用时区规则
+  （`related_record_ids.timezones`），结果判不可行。
+- **锚点**：naive 锚点读数按 fold=0 确定性解释（重叠/空洞时给出警告），
+  保证时钟模型单值；夏令时两侧的锚点（EDT/EST）可正确拟合同一线性模型。
+- **组合与限制**：时区声明可与候选关联、分段时钟（作用于不同来源）组合；
+  同一来源暂不支持同时声明时区与分段规则（校验报错）。声明时区后该来源的
+  `declared_utc_offset_s` 被忽略（给出警告）。
+
+时区声明随场景版本一并保存；校核是确定性的，对已存版本重新校核即可复现
+解析决策。`/compare` 通过 `timezones_only_*`、
+`timezone_declarations_changed` 与 `fold_differences` 展示两方案的时区
+声明与 fold 采用差异。未声明 `iana_timezone` 的旧请求行为完全不变
+（`timezone` 为 null）。
 
 ## 候选事件关联求解
 
@@ -209,7 +248,12 @@ docker run -p 8000:8000 -v "$PWD/data:/data" forensic-timeline-api
    偏移/漂移并计算段间跳变量，事件按钟面读数归段，边界不确定区内的事件
    保留多个跨段归属并做分支限界 + 差分约束求解；候选分段方案按
    （可行性, 残差 RMS, 段数, 归属成本）排序，矛盾链标注涉及的段与锚点。
-7. 每项计算结果（`Quantity`）都带 **单位、来源/锚点/事件 ID 与 `derived_by`
+7. **IANA 时区歧义求解**：声明了 `iana_timezone` 的来源，naive 读数经
+   `zoneinfo`/`tzdata` 按 PEP 495 往返校验展开为全部合法 UTC 候选
+   （回拨重叠 2 个、跳时空洞 0 个）；歧义事件的 fold 组合接入差分约束 +
+   分支限界，由事件约束选取可行组合（fold=0 优先为代表解），节点上限
+   截断时报告稳定状态；逐事件返回候选 UTC、采用的偏移与选择依据。
+8. 每项计算结果（`Quantity`）都带 **单位、来源/锚点/事件 ID 与 `derived_by`
    推导路径**。
 
 ## 测试
@@ -220,4 +264,6 @@ python -m pytest
 ```
 
 `tests/test_timezone.py` 通过 `time.tzset()` 在 UTC / America/New_York /
-Asia/Tokyo 三种进程时区下比对完整时间线，确保结论不随部署环境漂移。
+Asia/Tokyo 三种进程时区下比对完整时间线，确保结论不随部署环境漂移；
+`tests/test_timezone_ambiguity.py` 覆盖回拨重叠的 fold 选取、春季跳时空洞、
+截断状态稳定性与 `/compare` 的时区差异展示。
