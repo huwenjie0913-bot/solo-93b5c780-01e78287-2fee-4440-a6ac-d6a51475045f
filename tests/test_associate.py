@@ -199,15 +199,103 @@ def test_node_limit_truncation():
     assert a.stats.nodes_expanded == 1
 
 
-def test_hypothesis_limit_truncation():
-    """可行假设收集上限截断。"""
-    sc = make_scenario([one_group()])
-    r = reconcile(sc, assoc_top_k=5, assoc_max_hypotheses=1)
-    a = r.association
-    assert a.status == "truncated"
-    assert a.stats.truncation_reason == "hypothesis_limit"
-    assert a.total_feasible_found == 1
-    assert a.returned_k == 1
+def test_hypothesis_cap_keeps_global_top_k():
+    """反例回归：max_hypotheses 受限时仍须返回全局最优前 K，而非先发现的前 K 个叶子。
+
+    g1 候选代价 [0, 1]、g2 候选代价 [10, 0]（组内按代价升序后 g2 为 [0, 10]），
+    可行叶子的发现序总代价为 0, 10, 1, 11；上限 2 时旧实现会留下 {0, 10} 并截断，
+    正确行为是搜索穷尽后保留全局最优 {0, 1}。
+    """
+    sc = Scenario(
+        name="代价交错",
+        sources=[
+            SourceClock(id="door", declared_utc_offset_s=0, base_uncertainty_s=1.0),
+            SourceClock(id="cam", declared_utc_offset_s=0, base_uncertainty_s=1.0),
+        ],
+        events=[
+            Event(id="base1", source_id="door", reading="2026-09-14T08:00:00Z"),
+            Event(id="base2", source_id="door", reading="2026-09-14T10:00:00Z"),
+            Event(id="cA", source_id="cam", reading="2026-09-14T08:00:05Z"),
+            Event(id="cB", source_id="cam", reading="2026-09-14T08:00:07Z"),
+            Event(id="cC", source_id="cam", reading="2026-09-14T10:00:03Z"),
+            Event(id="cD", source_id="cam", reading="2026-09-14T10:00:04Z"),
+        ],
+        association_groups=[
+            AssociationGroup(
+                id="g1", base_event_id="base1", mode="exactly_one",
+                candidates=[
+                    AssociationCandidate(event_id="cA", tolerance_s=1000.0, cost=0.0),
+                    AssociationCandidate(event_id="cB", tolerance_s=1000.0, cost=1.0),
+                ],
+            ),
+            AssociationGroup(
+                id="g2", base_event_id="base2", mode="exactly_one",
+                candidates=[
+                    AssociationCandidate(event_id="cC", tolerance_s=1000.0, cost=10.0),
+                    AssociationCandidate(event_id="cD", tolerance_s=1000.0, cost=0.0),
+                ],
+            ),
+        ],
+    )
+    a = reconcile(sc, assoc_top_k=2, assoc_max_hypotheses=2).association
+    assert a.status == "ok"
+    assert a.stats.truncated is False
+    # 4 个可行叶子全部发现，按排序键保留最优 2 个
+    assert a.stats.leaves_feasible == 4
+    assert a.total_feasible_found == 2
+    assert a.returned_k == 2
+    assert [h.score.total_cost for h in a.hypotheses] == [0.0, 1.0]
+    assert [{p.group_id: p.candidate_event_id for p in h.pairings} for h in a.hypotheses] == [
+        {"g1": "cA", "g2": "cD"},
+        {"g1": "cB", "g2": "cD"},
+    ]
+
+
+def test_hypothesis_cap_exact_match_is_ok():
+    """反例回归：搜索已穷尽且可行假设数恰好等于上限 → ok，不得标记 truncated。"""
+    sc = make_scenario([one_group()])  # 恰好 2 个可行叶子（photo1/photo2），photo3 被剪
+    a = reconcile(sc, assoc_top_k=5, assoc_max_hypotheses=2).association
+    assert a.status == "ok"
+    assert a.stats.truncated is False
+    assert a.stats.truncation_reason is None
+    assert a.stats.leaves_feasible == 2
+    assert a.total_feasible_found == 2
+    assert a.returned_k == 2
+
+
+def test_reuse_deadlock_reports_chain():
+    """反例回归：两个 exactly_one 组仅因争用同一候选而无解时，
+    eliminated_groups 与 contradiction 应列出相关组及复用冲突链。"""
+    groups = [
+        AssociationGroup(
+            id="g1", base_event_id="badge", mode="exactly_one",
+            candidates=[AssociationCandidate(event_id="photo1", tolerance_s=5.0)],
+        ),
+        AssociationGroup(
+            id="g2", base_event_id="photo2", mode="exactly_one",
+            candidates=[AssociationCandidate(event_id="photo1", tolerance_s=20.0)],
+        ),
+    ]
+    a = reconcile(make_scenario(groups)).association
+    assert a.status == "infeasible"
+    assert a.hypotheses == []
+    assert a.stats.branches_pruned == 0  # 并非时间矛盾，纯复用冲突
+    assert a.stats.reuse_conflicts == 1
+    # 被阻塞的组进入 eliminated_groups，带复用冲突链样本
+    elim = {g.group_id: g for g in a.eliminated_groups}
+    assert set(elim) == {"g2"}
+    assert elim["g2"].reuse_conflicts == 1
+    sample = elim["g2"].sample_contradiction
+    assert sample is not None
+    assert set(sample.related_record_ids["association_groups"]) == {"g1", "g2"}
+    # 代表性矛盾链列出两个相关组与共享候选
+    contra = a.contradiction
+    assert contra is not None
+    assert set(contra.related_record_ids["association_groups"]) == {"g1", "g2"}
+    assert "photo1" in contra.related_record_ids["events"]
+    assert set(contra.cycle_constraint_ids) == {"assoc:g1", "assoc:g2"}
+    assert "复用" in contra.explanation
+    assert "g1" in contra.explanation and "g2" in contra.explanation
 
 
 def test_top_k_limits_returned():

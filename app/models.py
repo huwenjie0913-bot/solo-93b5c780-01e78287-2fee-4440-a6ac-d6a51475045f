@@ -283,16 +283,19 @@ class AssociationHypothesis(BaseModel):
 
 
 class GroupElimination(BaseModel):
-    """搜索中某关联组被剪枝的统计与样本矛盾链。"""
+    """搜索中某关联组被剪枝/复用冲突淘汰的统计与样本矛盾链。"""
 
     group_id: str
     base_event_id: str
     pruned_branches: int = Field(
         ..., description="该组层面上被差分约束校核剪掉的候选分支总数（跨整棵搜索树累计）"
     )
+    reuse_conflicts: int = Field(
+        0, description="该组因候选事件被其他关联组占用（不可跨组复用）而淘汰的分支数"
+    )
     total_options: int = Field(..., description="该组的可选项数（候选数，at_most_one 含跳过项）")
     sample_contradiction: Optional[Contradiction] = Field(
-        None, description="该组首个被剪枝分支的矛盾链样本"
+        None, description="该组首个被淘汰分支的矛盾链/复用冲突链样本"
     )
 
 
@@ -305,13 +308,16 @@ class AssociationSearchStats(BaseModel):
     reuse_conflicts: int = Field(
         ..., description="因候选事件跨组复用冲突而被跳过的分支数"
     )
-    leaves_feasible: int = Field(..., description="找到的可行完整假设数（≤ max_hypotheses）")
+    leaves_feasible: int = Field(
+        ...,
+        description="搜索中发现的可行完整假设总数（可超过 max_hypotheses；超出时仅按排序键保留最优者）",
+    )
     top_k: int
     max_hypotheses: int
     max_search_nodes: int
     truncated: bool
     truncation_reason: Optional[str] = Field(
-        None, description="截断原因：node_limit / hypothesis_limit；未截断为 null"
+        None, description="截断原因：node_limit（达到节点上限且仍有节点未探索）；未截断为 null"
     )
 
 
@@ -325,13 +331,18 @@ class AssociationResult(BaseModel):
     hypotheses: list[AssociationHypothesis] = Field(
         default_factory=list, description="按（总代价, 时间残差）稳定排序的前 K 个可行假设"
     )
-    total_feasible_found: int = Field(..., description="搜索中发现的可行假设总数（≤ max_hypotheses）")
+    total_feasible_found: int = Field(
+        ...,
+        description="保留的可行假设数（≤ max_hypotheses；按 (总代价, 时间残差, 发现序) 保留全局最优者）",
+    )
     returned_k: int = Field(..., description="本次返回的假设数")
     eliminated_groups: list[GroupElimination] = Field(
-        default_factory=list, description="搜索中发生过分支剪枝的关联组及样本矛盾链"
+        default_factory=list,
+        description="搜索中发生过分支淘汰（差分约束剪枝或候选复用冲突）的关联组及样本矛盾链",
     )
     contradiction: Optional[Contradiction] = Field(
-        None, description="代表性矛盾链（最深被剪枝分支；基础场景不可行时为基础矛盾）"
+        None,
+        description="代表性矛盾链（最深被淘汰分支的负环或复用冲突链；基础场景不可行时为基础矛盾）",
     )
     stats: AssociationSearchStats
     method: str
