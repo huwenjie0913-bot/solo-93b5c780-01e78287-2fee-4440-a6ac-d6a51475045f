@@ -43,9 +43,12 @@ class ClockSegment(BaseModel):
 
     设备重启、人工校时、断电后时钟可能跳变；每段独立拟合偏移与漂移，
     事件按钟面读数归入对应段。``start_clock_reading`` 为该段生效的钟面
-    时刻（按来源 ``declared_utc_offset_s`` 解释）；第一段视为初始段，
-    覆盖早于其生效时刻的读数。``boundary_uncertainty_s`` 给出边界时刻的
-    不确定半宽：钟面读数落在边界 ± 该半宽内的事件保留跨段候选归属。
+    时刻（按来源 ``declared_utc_offset_s`` 解释）；每条声明都是一个**边界**：
+    从该钟面时刻起进入“边界后段”，段 ID 即边界标识。首个边界之前还存在一个
+    由系统生成稳定 ID（``seg-initial``，冲突时追加序号）的隐式**初始段**，
+    因此只声明一个边界（如 ``seg-boot``）时边界前后是两个不同的物理段。
+    ``boundary_uncertainty_s`` 给出边界时刻的不确定半宽：钟面读数落在
+    边界 ± 该半宽内的事件保留跨段候选归属。
     """
 
     id: str = Field(..., description="来源内唯一的时钟段 ID，如 seg-boot-1")
@@ -67,7 +70,11 @@ class SourceSegmentation(BaseModel):
 
     source_id: str = Field(..., description="适用的时钟来源 ID")
     segments: list[ClockSegment] = Field(
-        default_factory=list, description="显式声明的时钟段（第一段为初始段）"
+        default_factory=list,
+        description=(
+            "显式声明的跳变边界（边界后段 ID 即段 ID，按生效钟面时刻排序）；"
+            "首个边界之前的隐式初始段由系统生成稳定 ID seg-initial"
+        ),
     )
     jump_threshold_s: Optional[float] = Field(
         None,

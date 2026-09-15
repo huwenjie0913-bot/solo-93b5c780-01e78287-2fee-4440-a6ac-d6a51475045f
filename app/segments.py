@@ -27,7 +27,6 @@ from typing import Optional
 from .dcs import Edge, _bellman_ford, extract_cycle
 from .models import (
     CalibrationAnchor,
-    ClockSegment,
     Contradiction,
     DetectedJumpCandidate,
     Event,
@@ -45,7 +44,6 @@ from .models import (
 from .timescale import (
     ClockModelError,
     FittedClock,
-    TimeParseError,
     _fit_anchors,
     format_iso,
     invert_event_interval,
@@ -219,7 +217,17 @@ def _prepare_source(
                     f"{b0.seg_id}({format_iso(b0.clock_t)}) 不晚于 "
                     f"{b1.seg_id}({format_iso(b1.clock_t)})"
                 )
-    initial_id = declared[0].seg_id if declared else "seg-initial"
+    # 隐式初始段（首个边界之前）必须有稳定且与所有“边界后段”不同的标识，
+    # 否则只声明一个边界（如 seg-boot）时，边界前后两段会同名，边界事件的
+    # 多个可行归属坍缩成一个 GID，差分约束被误判为不可行。
+    taken_ids = set(seen_ids)
+    initial_id = "seg-initial"
+    if initial_id in taken_ids:
+        k = 1
+        while f"seg-initial-{k}" in taken_ids:
+            k += 1
+        initial_id = f"seg-initial-{k}"
+    taken_ids.add(initial_id)
     earliest_clock = min(
         [r.clock_t for r in rows] + [e.clock_t for e in ev_rows],
         default=0.0,
@@ -253,7 +261,13 @@ def _prepare_source(
                 )
                 jump_est = r1.clock_t - pred_clock
             unc = max(r0.ref_unc, r1.ref_unc) + rule.auto_boundary_uncertainty_s
-            seg_id = f"seg-auto-{auto_idx}"
+            base_id = f"seg-auto-{auto_idx}"
+            seg_id = base_id
+            n_suffix = 1
+            while seg_id in taken_ids:
+                seg_id = f"{base_id}-{n_suffix}"
+                n_suffix += 1
+            taken_ids.add(seg_id)
             cand = DetectedJumpCandidate(
                 source_id=source.id,
                 boundary_segment_id=seg_id,
@@ -1050,6 +1064,7 @@ def run_segmentation(
     detected_all = [d for p in plans for d in p.detected]
     any_assign_truncated = any(e.truncated for e in evaluations)
     if any_feasible:
+        # 找到至少一个可行方案即视为校核成功；截断仅表示枚举/归属搜索未尽
         status = "ok"
     elif enum_truncated or any_assign_truncated:
         status = "truncated"

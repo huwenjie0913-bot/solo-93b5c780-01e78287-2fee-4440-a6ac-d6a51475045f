@@ -42,7 +42,7 @@ docker run -p 8000:8000 -v "$PWD/data:/data" forensic-timeline-api
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/reconcile?budget_s=&top_k=&max_hypotheses=&max_search_nodes=` | 校核场景，返回统一时间线；带 `budget_s` 时附偏移建议；声明了关联组时附关联假设 |
+| POST | `/reconcile?budget_s=&top_k=&max_hypotheses=&max_search_nodes=` | 校核场景，返回统一时间线；带 `budget_s` 时附偏移建议；声明了关联组时附关联假设；声明了 `clock_segments` 时附分段时钟报告 |
 | POST | `/scenarios` | 创建场景（v1，入 SQLite） |
 | GET | `/scenarios` | 列出场景（最新版本） |
 | GET | `/scenarios/{id}/versions` | 列出某场景全部版本 |
@@ -137,6 +137,57 @@ docker run -p 8000:8000 -v "$PWD/data:/data" forensic-timeline-api
 规则定义发生变化的组，以及各自返回的假设数与最优假设总代价。
 未声明 `association_groups` 的旧请求行为完全不变（`association` 为 null）。
 
+## 分段时钟模型（重启 / 人工校时 / 断电跳变）
+
+单条线性漂移会把一次**时钟跳变**摊进整段取证时间线。声明 `clock_segments`
+后，校核对指定来源启用**分段时钟模型**；未声明分段配置的请求继续使用
+原有单线性模型，行为完全不变（`segmentation` 为 null）。
+
+```json
+"clock_segments": [
+  {
+    "source_id": "dev",
+    "segments": [
+      {"id": "seg-boot",
+       "start_clock_reading": "2026-09-14T00:00:00Z",
+       "boundary_uncertainty_s": 60.0}
+    ]
+  }
+]
+```
+
+- **段标识**：每个声明项是一个跳变**边界**，段 ID 即“边界后段”的标识
+  （如 `seg-boot`）；首个边界之前还有一个由系统生成稳定 ID 的隐式
+  **初始段** `seg-initial`（与声明 ID 冲突时追加序号）。因此只声明一个
+  边界时，边界前后是 `seg-initial` / `seg-boot` 两个不同的物理段。
+- **段级拟合与跳变量**：每段用各自锚点独立 OLS 拟合偏移与漂移；
+  无锚点的段沿用前段模型（报告标注）。跳变量定义为“同一真实时刻下，
+  后段钟面与前段外推钟面之差”，正值=钟被向前拨。
+- **按钟面读数归段**：事件用其**钟面读数**（非反演真值）与边界比较。
+  读数落在边界 ± `boundary_uncertainty_s` 内的事件保留跨段候选归属
+  （如同时可能属于 `seg-initial` 与 `seg-boot`），用分支限界 +
+  Bellman-Ford 差分约束剪枝搜索可行归段解——两个归属会产生不同的
+  事件区间并**实际参与约束求解**，由约束决定采用哪个归属。
+- **残差自动检测**：也可不显式给段，只给 `jump_threshold_s`
+  （来源级）或场景级 `auto_jump_threshold_s`。系统对连续锚点做单线性
+  拟合，当相邻锚点残差跳变 `|Δ残差| ≥ 阈值` 时生成跳变候选
+  （返回在 `detected_jumps`），枚举其采纳子集与显式边界组合成候选
+  分段方案，方案在 `max_segment_schemes`（默认 32）上限内按
+  （可行性, 锚点残差 RMS, 段数, 跨段归属成本）稳定排序。
+- **校核结果**：`segmentation.schemes[]` 返回每个方案的段级参数
+  （偏移/漂移/锚点数/残差）、跳变量、逐事件归段依据（`assignments`，
+  含名义段、全部可行归属、采用段、模糊标记）、排序名次与方案键 `key`。
+  排名 1 的方案为代表方案，其统一时间线在每个事件上给出
+  `segment_ids`（可行归属）与 `assigned_segment_id`（采用段）。
+- **矛盾溯源**：若所有分段方案都无法满足约束，代表性矛盾链的
+  `segment_ids` 与 `related_record_ids.clock_segments / anchors`
+  会指出涉及的时钟段与锚点。
+- **版本与比较**：分段规则随场景版本入库；`/compare` 报告分段规则的
+  新增来源（`segment_sources_only_*`）、定义变化
+  （`segment_rules_changed`）、边界的新增/删除/生效时刻移动
+  （`segment_boundary_moves`，含秒级 `delta_s`）以及代表方案键
+  `best_scheme_left/right` 与 `best_scheme_changed`。
+
 ## 计算模型
 
 1. **时钟拟合**：每个来源的锚点 (真实时刻, 钟面读数) 用 OLS 拟合线性模型
@@ -153,7 +204,12 @@ docker run -p 8000:8000 -v "$PWD/data:/data" forensic-timeline-api
 5. **候选关联求解**：声明了关联组时，按候选数优先的分支顺序做分支限界，
    逐层复用差分约束校核剪枝，候选事件全局不可复用；搜索在节点上限内穷尽，
    按（总代价, 时间残差）稳定保留最优的 max_hypotheses 个假设并返回前 K。
-6. 每项计算结果（`Quantity`）都带 **单位、来源/锚点/事件 ID 与 `derived_by`
+6. **分段时钟模型**：声明了 `clock_segments` 时，跳变边界（显式声明或由
+   连续锚点残差阈值自动检测）把每台设备的钟切成独立段；每段独立 OLS 拟合
+   偏移/漂移并计算段间跳变量，事件按钟面读数归段，边界不确定区内的事件
+   保留多个跨段归属并做分支限界 + 差分约束求解；候选分段方案按
+   （可行性, 残差 RMS, 段数, 归属成本）排序，矛盾链标注涉及的段与锚点。
+7. 每项计算结果（`Quantity`）都带 **单位、来源/锚点/事件 ID 与 `derived_by`
    推导路径**。
 
 ## 测试
